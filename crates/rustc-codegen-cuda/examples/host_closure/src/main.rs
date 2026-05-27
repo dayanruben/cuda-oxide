@@ -25,6 +25,10 @@
 //!    on either side.
 //! 5. Equivalent coverage through sync and async typed and untyped launch paths.
 //! 6. A where-clause `Fn` bound and layout-sensitive captures.
+//! 7. `FnMut` and `FnOnce` trait bounds, so the device-side dispatch path is
+//!    exercised for all three closure traits.
+//! 8. Both reordered (default Rust repr, mixed-size fields) and identity-order
+//!    (`#[repr(C)]`) struct captures.
 
 use cuda_async::device_operation::DeviceOperation;
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
@@ -33,6 +37,18 @@ use cuda_host::{cuda_launch, cuda_launch_async, cuda_module, load_kernel_module}
 
 #[derive(Clone, Copy)]
 struct MixedCapture {
+    small: u8,
+    wide: f64,
+    scale: f32,
+}
+
+/// Same field set as [`MixedCapture`], but `#[repr(C)]` pins the layout to
+/// declaration order (no rustc field reordering). The closure-layout fix has
+/// to handle both the reordered and the identity-order cases, so we exercise
+/// the identity path explicitly.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct ReprCMixed {
     small: u8,
     wide: f64,
     scale: f32,
@@ -65,6 +81,40 @@ mod kernels {
     where
         T: Copy,
         F: Fn(T) -> T + Copy,
+    {
+        let idx = thread::index_1d();
+        let idx_raw = idx.get();
+        if let Some(out_elem) = out.get_mut(idx) {
+            *out_elem = f(input[idx_raw]);
+        }
+    }
+
+    /// Same as [`map`] but with a `FnMut` trait bound, so the device-side
+    /// dispatch goes through `<F as FnMut>::call_mut` instead of `Fn::call`.
+    /// The closure is `Copy`, so each thread mutates its own register-resident
+    /// copy of the closure environment.
+    #[kernel]
+    pub fn map_mut<T, F>(mut f: F, input: &[T], mut out: DisjointSlice<T>)
+    where
+        T: Copy,
+        F: FnMut(T) -> T + Copy,
+    {
+        let idx = thread::index_1d();
+        let idx_raw = idx.get();
+        if let Some(out_elem) = out.get_mut(idx) {
+            *out_elem = f(input[idx_raw]);
+        }
+    }
+
+    /// Same as [`map`] but with a `FnOnce` trait bound, so the device-side
+    /// dispatch goes through `<F as FnOnce>::call_once` (which consumes the
+    /// closure). The `Copy` bound lets the kernel re-invoke `call_once` per
+    /// thread on a freshly-copied closure rather than running it exactly once.
+    #[kernel]
+    pub fn map_once<T, F>(f: F, input: &[T], mut out: DisjointSlice<T>)
+    where
+        T: Copy,
+        F: FnOnce(T) -> T + Copy,
     {
         let idx = thread::index_1d();
         let idx_raw = idx.get();
@@ -388,6 +438,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // =========================================================================
     // TEST 9: non-move reference captures
     // =========================================================================
+    //
+    // NOTE: this case relies on Heterogeneous Memory Management. Without
+    // `move`, the closure environment holds `&f32` pointers into the host
+    // stack frame of `main`; the GPU dereferences those pointers at kernel
+    // entry. Working configurations need an HMM-capable GPU (sm_75+ on
+    // Linux) with HMM enabled in the driver. On systems without HMM this
+    // surfaces as `CUDA_ERROR_ILLEGAL_ADDRESS` from the launch, which the
+    // smoketest's `verdict_standard` correctly flags as FAIL.
     println!("Test 9: non-move reference captures");
     {
         let scale = 0.5f32;
@@ -402,6 +460,79 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             map_async,
             |x: f32| x * scale + bias,
             |x| x * scale + bias,
+            1e-5
+        );
+        println!();
+    }
+
+    // =========================================================================
+    // TEST 10: FnMut bound — different device-side dispatch from Fn
+    // =========================================================================
+    println!("Test 10: FnMut bound (multi-capture)");
+    {
+        let scale = 1.5f32;
+        let offset = 6.0f32;
+        println!("  scale = {}, offset = {}", scale, offset);
+
+        run_launch_matrix!(
+            "FnMut bound, multi-capture",
+            map_mut::<f32, _>,
+            map_mut,
+            map_mut_async,
+            move |x: f32| x * scale + offset,
+            |x| x * scale + offset,
+            1e-5
+        );
+        println!();
+    }
+
+    // =========================================================================
+    // TEST 11: FnOnce bound — call_once dispatch with Copy
+    // =========================================================================
+    println!("Test 11: FnOnce bound (multi-capture, Copy closure)");
+    {
+        let weight = 2.25f32;
+        let intercept = 12.5f32;
+        println!("  weight = {}, intercept = {}", weight, intercept);
+
+        run_launch_matrix!(
+            "FnOnce bound, multi-capture",
+            map_once::<f32, _>,
+            map_once,
+            map_once_async,
+            move |x: f32| x * weight + intercept,
+            |x| x * weight + intercept,
+            1e-5
+        );
+        println!();
+    }
+
+    // =========================================================================
+    // TEST 12: #[repr(C)] struct capture (identity-order layout)
+    // =========================================================================
+    // Counterpart to test 8: the layout fix has to handle both the reordered
+    // case (default Rust repr, fields packed by size) and the identity-order
+    // case (`#[repr(C)]`, fields kept in declaration order). The closure
+    // body is the same as test 8 so the expected output is comparable.
+    println!("Test 12: #[repr(C)] struct capture (identity-order layout)");
+    {
+        let mixed = ReprCMixed {
+            small: 9,
+            wide: 2.25,
+            scale: 0.75,
+        };
+        println!(
+            "  small = {}, scale = {}, wide = {}",
+            mixed.small, mixed.scale, mixed.wide
+        );
+
+        run_launch_matrix!(
+            "repr(C) struct capture",
+            map::<f32, _>,
+            map,
+            map_async,
+            move |x: f32| x * mixed.scale + mixed.wide as f32 + mixed.small as f32,
+            |x| x * mixed.scale + mixed.wide as f32 + mixed.small as f32,
             1e-5
         );
         println!();
