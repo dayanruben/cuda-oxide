@@ -1,3 +1,8 @@
+/*
+  SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  SPDX-License-Identifier: Apache-2.0
+*/
+
 {
   description = "Development shell for cuda-oxide";
 
@@ -8,6 +13,7 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    crane.url = "github:ipetkov/crane";
   };
 
   outputs =
@@ -15,9 +21,56 @@
       nixpkgs,
       flake-utils,
       rust-overlay,
+      crane,
       ...
     }:
-    flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" ] (
+    let
+      # Template flake for user projects. Extends cuda-oxide's devShell via
+      # inputsFrom so users can add their own packages while inheriting the full
+      # CUDA + Rust environment (including the shellHook that wires up the host
+      # NVIDIA driver). nixpkgs and flake-utils are followed from cuda-oxide to
+      # avoid duplicate closures.
+      userFlakeContent = ''
+        {
+          description = "A cuda-oxide project";
+
+          inputs = {
+            cuda-oxide.url = "github:NVlabs/cuda-oxide";
+            nixpkgs.follows = "cuda-oxide/nixpkgs";
+            flake-utils.follows = "cuda-oxide/flake-utils";
+          };
+
+          outputs =
+            {
+              cuda-oxide,
+              nixpkgs,
+              flake-utils,
+              ...
+            }:
+            flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" ] (
+              system:
+              let
+                pkgs = nixpkgs.legacyPackages.''${system};
+              in
+              {
+                devShells.default = pkgs.mkShell {
+                  inputsFrom = [ cuda-oxide.devShells.''${system}.default ];
+                  packages = [
+                    # add project-specific packages here
+                  ];
+                };
+              }
+            );
+        }
+      '';
+
+      userFlake = builtins.toFile "flake.nix" userFlakeContent;
+
+      # Directory used by `nix flake init -t github:NVlabs/cuda-oxide`.
+      # Content is system-independent; x86_64-linux is chosen arbitrarily.
+      templateSrc = nixpkgs.legacyPackages.x86_64-linux.writeTextDir "flake.nix" userFlakeContent;
+    in
+    (flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" ] (
       system:
       let
         overlays = [ (import rust-overlay) ];
@@ -29,7 +82,7 @@
         };
 
         # LLVM
-        llvmPkgs = pkgs.llvmPackages_21;
+        llvmPkgs = pkgs.llvmPackages_22;
 
         # Nightly Rust
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
@@ -45,9 +98,63 @@
             libnvjitlink.lib
           ];
         };
+
+        craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
+
+        cargoOxideCommonArgs = {
+          src = ./.;
+          cargoExtraArgs = "-p cargo-oxide";
+          doCheck = false;
+
+          nativeBuildInputs = [
+            llvmPkgs.clang
+            llvmPkgs.libclang
+          ];
+
+          CUDA_HOME = cudaSymlinked;
+          LIBCLANG_PATH = "${llvmPkgs.libclang.lib}/lib";
+        };
+
+        cargoOxideDeps = craneLib.buildDepsOnly (
+          craneLib.crateNameFromCargoToml { cargoToml = ./crates/cargo-oxide/Cargo.toml; }
+          // cargoOxideCommonArgs
+        );
+
+        new-project = pkgs.writeShellApplication {
+          name = "cuda-oxide-new";
+          runtimeInputs = [ cargo-oxide ];
+          text = ''
+            output=$(cargo-oxide new "$@")
+            cp ${userFlake} "$1/flake.nix"
+            chmod +w "$1/flake.nix"
+            echo "Note: run 'nix develop' inside the project directory before using cargo oxide."
+            echo ""
+            echo "$output"
+          '';
+        };
+
+        cargo-oxide = craneLib.buildPackage (
+          craneLib.crateNameFromCargoToml { cargoToml = ./crates/cargo-oxide/Cargo.toml; }
+          // cargoOxideCommonArgs
+          // {
+            cargoArtifacts = cargoOxideDeps;
+          }
+        );
       in
       {
         formatter = pkgs.nixfmt;
+
+        packages.cargo-oxide = cargo-oxide;
+
+        apps.default = {
+          type = "app";
+          program = "${cargo-oxide}/bin/cargo-oxide";
+        };
+
+        apps.new = {
+          type = "app";
+          program = "${new-project}/bin/cuda-oxide-new";
+        };
 
         devShells.default = pkgs.mkShell {
           packages = [
@@ -55,16 +162,16 @@
 
             llvmPkgs.clang
             llvmPkgs.libclang
-            llvmPkgs.llvm
 
             cudaSymlinked
+
+            cargo-oxide
           ];
 
-          CUDA_HOME = cudaSymlinked;
-          LIBCLANG_PATH = "${llvmPkgs.libclang.lib}/lib";
-          CUDA_OXIDE_LLC = "${llvmPkgs.llvm}/bin/llc";
-
           shellHook = ''
+            export CUDA_HOME="${cudaSymlinked}"
+            export LIBCLANG_PATH="${llvmPkgs.libclang.lib}/lib"
+
             # GPU driver setup borrowed from https://github.com/NVlabs/cutile-rs
             # NixOS provides /run/opengl-driver/lib
             if [ -d /run/opengl-driver/lib ]; then
@@ -99,11 +206,16 @@
             fi
 
             echo "🦀 cuda-oxide dev environment loaded"
-            echo " ✓ LLVM $(llc   --version | grep 'LLVM version' | awk '{print $3}')"
             echo " ✓ CUDA $(nvcc  --version | grep 'release'      | awk '{print $6}' | cut -c 2-)"
             echo " ✓ Rust $(rustc --version |                       awk '{print $2}')"
           '';
         };
       }
-    );
+    ))
+    // {
+      templates.default = {
+        path = templateSrc;
+        description = "Reproducible CUDA + Rust dev environment for cuda-oxide projects";
+      };
+    };
 }
