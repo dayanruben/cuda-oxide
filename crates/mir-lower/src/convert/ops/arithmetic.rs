@@ -631,7 +631,13 @@ pub(crate) fn convert_cmp(
     let (lhs, rhs) = get_binary_operands(op, ctx)?;
 
     let llvm_op = if is_float_type(ctx, lhs) {
-        llvm::FCmpOp::new(ctx, float_pred, lhs, rhs).get_operation()
+        // Upstream FCmpOp carries the FastMathFlags interface, whose verifier
+        // requires the `llvm_fast_math_flags` attribute to be present (it is
+        // not set by `FCmpOp::new`). Attach default flags, as the float
+        // arithmetic ops do.
+        let fcmp = llvm::FCmpOp::new(ctx, float_pred, lhs, rhs).get_operation();
+        add_fastmath_flags(ctx, fcmp);
+        fcmp
     } else {
         let pred = if is_signed_int_op(ctx, op, operands_info)? {
             signed_pred

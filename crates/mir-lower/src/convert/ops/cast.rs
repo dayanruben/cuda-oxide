@@ -458,7 +458,8 @@ fn emit_pointer_cast(
         Ok(llvm::LoadOp::new(ctx, ptr, llvm_ty).get_operation())
     } else if let (Some(s), Some(d)) = (src_as, dst_as) {
         if s != d {
-            Ok(llvm::AddrSpaceCastOp::new(ctx, val, d).get_operation())
+            let cast_ty = dialect_llvm::types::PointerType::get(ctx, d).into();
+            Ok(llvm::AddrSpaceCastOp::new(ctx, val, cast_ty).get_operation())
         } else {
             Ok(llvm::BitcastOp::new(ctx, val, llvm_ty).get_operation())
         }

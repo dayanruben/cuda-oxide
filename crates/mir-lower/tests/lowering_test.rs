@@ -16,7 +16,6 @@ use pliron::operation::Operation;
 #[test]
 fn test_intrinsic_insertion() -> Result<(), anyhow::Error> {
     let mut ctx = Context::new();
-    dialect_llvm::register(&mut ctx);
     dialect_mir::register(&mut ctx);
     dialect_nvvm::register(&mut ctx);
     mir_lower::register(&mut ctx);
@@ -144,7 +143,6 @@ fn test_intrinsic_insertion() -> Result<(), anyhow::Error> {
 #[test]
 fn test_globaltimer_lowers_to_intrinsic_call() -> Result<(), anyhow::Error> {
     let mut ctx = Context::new();
-    dialect_llvm::register(&mut ctx);
     dialect_mir::register(&mut ctx);
     dialect_nvvm::register(&mut ctx);
     mir_lower::register(&mut ctx);
@@ -270,7 +268,6 @@ fn test_globaltimer_lowers_to_intrinsic_call() -> Result<(), anyhow::Error> {
 #[test]
 fn test_threadfence_system_lowers_to_inline_asm() -> Result<(), anyhow::Error> {
     let mut ctx = Context::new();
-    dialect_llvm::register(&mut ctx);
     dialect_mir::register(&mut ctx);
     dialect_nvvm::register(&mut ctx);
     mir_lower::register(&mut ctx);
@@ -345,10 +342,16 @@ fn test_threadfence_system_lowers_to_inline_asm() -> Result<(), anyhow::Error> {
             for func_block in func_region.deref(&ctx).iter(&ctx) {
                 for body_op in func_block.deref(&ctx).iter(&ctx) {
                     if let Some(inline_asm) = Operation::get_op::<llvm::InlineAsmOp>(body_op, &ctx)
-                        && inline_asm.asm_template(&ctx) == "membar.sys;"
+                        && inline_asm
+                            .get_attr_inline_asm_template(&ctx)
+                            .is_some_and(|s| String::from((*s).clone()) == "membar.sys;")
                     {
                         found_inline_asm = true;
-                        assert!(inline_asm.is_convergent(&ctx));
+                        assert!(
+                            inline_asm
+                                .get_attr_inline_asm_convergent(&ctx)
+                                .is_some_and(|b| bool::from((*b).clone()))
+                        );
                     }
                 }
             }
@@ -385,7 +388,6 @@ fn addrspace_coercion_inserts_addrspacecast_at_call_site() -> Result<(), anyhow:
     use pliron::builtin::types::{FunctionType, IntegerType, Signedness};
 
     let mut ctx = Context::new();
-    dialect_llvm::register(&mut ctx);
     dialect_mir::register(&mut ctx);
     dialect_nvvm::register(&mut ctx);
     mir_lower::register(&mut ctx);

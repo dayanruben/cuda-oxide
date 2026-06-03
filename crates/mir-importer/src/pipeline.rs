@@ -307,7 +307,11 @@ pub fn run_pipeline(
     if config.verbose {
         eprintln!("\n=== Running mem2reg ===");
     }
-    pliron::opts::mem2reg::mem2reg(module_op_ptr, &mut ctx).map_err(|e| {
+    // pliron's pass infra now threads an AnalysisManager through mem2reg
+    // (caches dominator trees etc.); we run it standalone, so a fresh empty
+    // manager suffices. The returned IRStatus (Changed/Unchanged) is discarded.
+    let mut analyses = pliron::pass_manager::AnalysisManager::default();
+    pliron::opts::mem2reg::mem2reg(module_op_ptr, &mut ctx, &mut analyses).map_err(|e| {
         PipelineError::Verification {
             name: "mem2reg".to_string(),
             message: e.disp(&ctx).to_string(),
@@ -520,11 +524,11 @@ fn append_to_module(ctx: &Context, module_op_ptr: Ptr<Operation>, func_op_ptr: P
 
 /// Lowers `dialect-mir` operations to `dialect-llvm`.
 ///
-/// Registers `dialect-llvm` and runs `mir-lower`'s `DialectConversion`-based
-/// pass, which converts each `dialect-mir`/`dialect-nvvm` op to its
-/// `dialect-llvm` equivalent.
+/// Runs `mir-lower`'s `DialectConversion`-based pass, which converts each
+/// `dialect-mir`/`dialect-nvvm` op to its `dialect-llvm` equivalent. The LLVM
+/// dialect auto-registers when the `Context` is created, so no explicit
+/// registration is needed here.
 fn lower_to_llvm(ctx: &mut Context, module_op_ptr: Ptr<Operation>) -> Result<(), PipelineError> {
-    dialect_llvm::register(ctx);
     mir_lower::register(ctx);
 
     mir_lower::lower_mir_to_llvm(ctx, module_op_ptr)
@@ -1123,7 +1127,6 @@ mod tests {
         use pliron::builtin::ops::ModuleOp;
         use pliron::builtin::types::{IntegerType, Signedness};
 
-        dialect_llvm::register(ctx);
         let module = ModuleOp::new(ctx, "test_module".try_into().unwrap());
         let module_ptr = module.get_operation();
         let module_region = module_ptr.deref(ctx).get_region(0);
@@ -1194,7 +1197,6 @@ mod tests {
         use pliron::builtin::types::{IntegerType, Signedness};
 
         let mut ctx = Context::new();
-        dialect_llvm::register(&mut ctx);
 
         let module = ModuleOp::new(&mut ctx, "test_module".try_into().unwrap());
         let module_ptr = module.get_operation();

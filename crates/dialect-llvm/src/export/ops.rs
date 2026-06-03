@@ -5,6 +5,7 @@
 
 //! Operation emission for LLVM IR.
 
+use std::cell::Ref;
 use std::collections::HashMap;
 use std::fmt::Write;
 
@@ -12,7 +13,7 @@ use pliron::r#type::Typed;
 use pliron::{
     basic_block::BasicBlock,
     builtin::{
-        attributes::{FPDoubleAttr, FPSingleAttr, IntegerAttr},
+        attributes::{BoolAttr, FPDoubleAttr, FPSingleAttr, IntegerAttr, StringAttr},
         op_interfaces::{CallOpCallable, CallOpInterface},
     },
     context::Ptr,
@@ -22,8 +23,11 @@ use pliron::{
 };
 
 use crate::{
-    attributes::{FCmpPredicateAttr, FPHalfAttr, GepIndexAttr, ICmpPredicateAttr},
-    ops::{self, LlvmAtomicOpInterface},
+    attributes::{
+        AtomicOrderingAttr, AtomicRmwKindAttr, FCmpPredicateAttr, FPHalfAttr, GepIndexAttr,
+        ICmpPredicateAttr,
+    },
+    ops,
     types::{FuncType, VoidType},
 };
 
@@ -100,7 +104,6 @@ enum LlvmOp<'op> {
     // Calls and inline assembly
     Call(&'op ops::CallOp),
     InlineAsm(&'op ops::InlineAsmOp),
-    InlineAsmMulti(&'op ops::InlineAsmMultiOp),
     // Casts
     Bitcast(&'op ops::BitcastOp),
     AddrSpaceCast(&'op ops::AddrSpaceCastOp),
@@ -188,7 +191,6 @@ impl<'op> TryFrom<&'op dyn Op> for LlvmOp<'op> {
             // Calls and inline assembly
             Call         => ops::CallOp,
             InlineAsm    => ops::InlineAsmOp,
-            InlineAsmMulti => ops::InlineAsmMultiOp,
             // Casts
             Bitcast      => ops::BitcastOp,
             AddrSpaceCast=> ops::AddrSpaceCastOp,
@@ -316,9 +318,6 @@ impl<'a> ModuleExportState<'a> {
             // Calls and inline assembly
             Some(LlvmOp::Call(op)) => self.emit_call(op, value_names, output)?,
             Some(LlvmOp::InlineAsm(op)) => self.emit_inline_asm(op, value_names, output)?,
-            Some(LlvmOp::InlineAsmMulti(op)) => {
-                self.emit_inline_asm_multi(op, value_names, output)?
-            }
             // Casts
             Some(LlvmOp::Bitcast(op)) => {
                 self.export_cast("bitcast", op.get_operation(), value_names, output)?
@@ -541,8 +540,8 @@ impl<'a> ModuleExportState<'a> {
         let ptr = op_ref.get_operand(0);
         let res_name = value_names.get(&res).unwrap();
         let ty = res.get_type(self.ctx);
-        let syncscope = ops::atomic::format_syncscope(&op.syncscope(self.ctx));
-        let ordering = ops::atomic::format_ordering(&op.ordering(self.ctx));
+        let syncscope = fmt_syncscope(op.get_attr_llvm_ld_syncscope(self.ctx));
+        let ordering = fmt_ordering(op.get_attr_llvm_ld_ordering(self.ctx));
         let addrspace = addrspace_of(ptr.get_type(self.ctx), self.ctx);
 
         write!(output, "  {res_name} = load atomic ").unwrap();
@@ -563,8 +562,8 @@ impl<'a> ModuleExportState<'a> {
         let op_ref = op.get_operation().deref(self.ctx);
         let val = op_ref.get_operand(0);
         let ptr = op_ref.get_operand(1);
-        let syncscope = ops::atomic::format_syncscope(&op.syncscope(self.ctx));
-        let ordering = ops::atomic::format_ordering(&op.ordering(self.ctx));
+        let syncscope = fmt_syncscope(op.get_attr_llvm_st_syncscope(self.ctx));
+        let ordering = fmt_ordering(op.get_attr_llvm_st_ordering(self.ctx));
         let addrspace = addrspace_of(ptr.get_type(self.ctx), self.ctx);
 
         write!(output, "  store atomic ").unwrap();
@@ -589,9 +588,9 @@ impl<'a> ModuleExportState<'a> {
         let ptr = op_ref.get_operand(0);
         let val = op_ref.get_operand(1);
         let res_name = value_names.get(&res).unwrap();
-        let rmw_kind = ops::atomic::format_rmw_kind(&op.rmw_kind(self.ctx));
-        let syncscope = ops::atomic::format_syncscope(&op.syncscope(self.ctx));
-        let ordering = ops::atomic::format_ordering(&op.ordering(self.ctx));
+        let rmw_kind = fmt_rmw_kind(op.get_attr_llvm_rmw_kind(self.ctx));
+        let syncscope = fmt_syncscope(op.get_attr_llvm_rmw_syncscope(self.ctx));
+        let ordering = fmt_ordering(op.get_attr_llvm_rmw_ordering(self.ctx));
         let addrspace = addrspace_of(ptr.get_type(self.ctx), self.ctx);
 
         write!(output, "  {res_name} = atomicrmw {rmw_kind} ").unwrap();
@@ -617,15 +616,16 @@ impl<'a> ModuleExportState<'a> {
         let cmp = op_ref.get_operand(1);
         let new_val = op_ref.get_operand(2);
         let res_name = value_names.get(&res).unwrap();
-        let success_ord = ops::atomic::format_ordering(&op.success_ordering(self.ctx));
-        let failure_ord = ops::atomic::format_ordering(&op.failure_ordering(self.ctx));
-        let syncscope = ops::atomic::format_syncscope(&op.syncscope(self.ctx));
+        let success_ord = fmt_ordering(op.get_attr_llvm_cas_success_ordering(self.ctx));
+        let failure_ord = fmt_ordering(op.get_attr_llvm_cas_failure_ordering(self.ctx));
+        let syncscope = fmt_syncscope(op.get_attr_llvm_cas_syncscope(self.ctx));
         let val_ty = cmp.get_type(self.ctx);
         let addrspace = addrspace_of(ptr.get_type(self.ctx), self.ctx);
 
-        // Emit cmpxchg returning { T, i1 }
-        let struct_name = format!("{res_name}.cx");
-        write!(output, "  {struct_name} = cmpxchg ").unwrap();
+        // pliron-llvm's cmpxchg result is the full `{ T, i1 }` struct; a
+        // separate `extractvalue` op (emitted on its own) pulls out the loaded
+        // value, so here we emit only the cmpxchg into the struct-typed result.
+        write!(output, "  {res_name} = cmpxchg ").unwrap();
         write!(output, "{}", ptr_qualifier(addrspace)).unwrap();
         self.export_value(ptr, value_names, output)?;
         write!(output, ", ").unwrap();
@@ -637,17 +637,12 @@ impl<'a> ModuleExportState<'a> {
         write!(output, " ").unwrap();
         self.export_value(new_val, value_names, output)?;
         writeln!(output, "{syncscope} {success_ord} {failure_ord}").unwrap();
-
-        // Extract old value (element 0 of { T, i1 })
-        write!(output, "  {res_name} = extractvalue {{ ").unwrap();
-        self.export_type(val_ty, output)?;
-        writeln!(output, ", i1 }} {struct_name}, 0").unwrap();
         Ok(())
     }
 
     fn emit_fence(&self, op: &ops::FenceOp, output: &mut String) -> Result<(), String> {
-        let syncscope = ops::atomic::format_syncscope(&op.syncscope(self.ctx));
-        let ordering = ops::atomic::format_ordering(&op.ordering(self.ctx));
+        let syncscope = fmt_syncscope(op.get_attr_llvm_fence_syncscope(self.ctx));
+        let ordering = fmt_ordering(op.get_attr_llvm_fence_ordering(self.ctx));
         writeln!(output, "  fence{syncscope} {ordering}").unwrap();
         Ok(())
     }
@@ -843,18 +838,21 @@ impl<'a> ModuleExportState<'a> {
         output: &mut String,
     ) -> Result<(), String> {
         let op_ref = op.get_operation().deref(self.ctx);
-        let asm_template = op.asm_template(self.ctx);
-        let constraints = op.constraints(self.ctx);
-        let is_convergent = op.is_convergent(self.ctx);
+        let asm_template = read_string_attr(op.get_attr_inline_asm_template(self.ctx));
+        let constraints = read_string_attr(op.get_attr_inline_asm_constraints(self.ctx));
+        let is_convergent = read_bool_attr(op.get_attr_inline_asm_convergent(self.ctx));
 
-        if op_ref.get_num_results() > 0 {
-            let res = op_ref.get_result(0);
+        // pliron-llvm always stores a single result slot (a void result for
+        // no-value asm), so decide void vs valued by the result *type*, not the
+        // result count.
+        let res = op_ref.get_result(0);
+        let res_ty = res.get_type(self.ctx);
+        if res_ty.deref(self.ctx).is::<VoidType>() {
+            write!(output, "  call void").unwrap();
+        } else {
             let res_name = value_names.get(&res).unwrap();
-            let res_ty = res.get_type(self.ctx);
             write!(output, "  {res_name} = call ").unwrap();
             self.export_type(res_ty, output)?;
-        } else {
-            write!(output, "  call void").unwrap();
         }
 
         write!(
@@ -876,89 +874,6 @@ impl<'a> ModuleExportState<'a> {
             self.convergent_used = true;
         } else {
             writeln!(output, ")").unwrap();
-        }
-        Ok(())
-    }
-
-    fn emit_inline_asm_multi(
-        &mut self,
-        op: &ops::InlineAsmMultiOp,
-        value_names: &HashMap<Value, String>,
-        output: &mut String,
-    ) -> Result<(), String> {
-        let op_ref = op.get_operation().deref(self.ctx);
-        let asm_template = op.asm_template(self.ctx);
-        let constraints = op.constraints(self.ctx);
-        let is_convergent = op.is_convergent(self.ctx);
-        let num_results = op_ref.get_num_results();
-
-        if num_results == 0 {
-            write!(output, "  call void").unwrap();
-            write!(
-                output,
-                " asm sideeffect \"{asm_template}\", \"{constraints}\"("
-            )
-            .unwrap();
-            for (i, arg) in op_ref.operands().enumerate() {
-                if i > 0 {
-                    write!(output, ", ").unwrap();
-                }
-                self.export_type(arg.get_type(self.ctx), output)?;
-                write!(output, " ").unwrap();
-                self.export_value(arg, value_names, output)?;
-            }
-            if is_convergent {
-                writeln!(output, ") #0").unwrap();
-                self.convergent_used = true;
-            } else {
-                writeln!(output, ")").unwrap();
-            }
-        } else {
-            // Build the struct return type
-            let mut struct_type = String::from("{");
-            for i in 0..num_results {
-                if i > 0 {
-                    struct_type.push_str(", ");
-                }
-                let res_ty = op_ref.get_result(i).get_type(self.ctx);
-                let mut ty_str = String::new();
-                self.export_type(res_ty, &mut ty_str)?;
-                struct_type.push_str(&ty_str);
-            }
-            struct_type.push('}');
-
-            let first_res_name = value_names.get(&op_ref.get_result(0)).unwrap();
-            let struct_result_name = format!("{first_res_name}_struct");
-
-            write!(output, "  {struct_result_name} = call {struct_type}").unwrap();
-            write!(
-                output,
-                " asm sideeffect \"{asm_template}\", \"{constraints}\"("
-            )
-            .unwrap();
-            for (i, arg) in op_ref.operands().enumerate() {
-                if i > 0 {
-                    write!(output, ", ").unwrap();
-                }
-                self.export_type(arg.get_type(self.ctx), output)?;
-                write!(output, " ").unwrap();
-                self.export_value(arg, value_names, output)?;
-            }
-            if is_convergent {
-                writeln!(output, ") #0").unwrap();
-                self.convergent_used = true;
-            } else {
-                writeln!(output, ")").unwrap();
-            }
-
-            for i in 0..num_results {
-                let res_name = value_names.get(&op_ref.get_result(i)).unwrap();
-                writeln!(
-                    output,
-                    "  {res_name} = extractvalue {struct_type} {struct_result_name}, {i}"
-                )
-                .unwrap();
-            }
         }
         Ok(())
     }
@@ -1062,7 +977,7 @@ impl<'a> ModuleExportState<'a> {
             // (e.g., 1u64 << 46 = 0x4000_0000_0000 would become 0x4000 = 16384).
             int_attr.value().to_string_unsigned_decimal()
         } else if let Some(fp16_attr) = val_attr.downcast_ref::<FPHalfAttr>() {
-            format_half_literal(fp16_attr.to_bits())
+            format_half_literal(crate::fp16_attr_to_bits(fp16_attr))
         } else if let Some(fp32_attr) = val_attr.downcast_ref::<FPSingleAttr>() {
             let float_val: f32 = fp32_attr.clone().into();
             format_float_literal(f64::from(float_val))
@@ -1170,5 +1085,57 @@ fn ptr_qualifier(addrspace: u32) -> String {
         format!("ptr addrspace({addrspace}) ")
     } else {
         "ptr ".to_string()
+    }
+}
+
+/// Read an optional `StringAttr` to an owned `String` (absent → empty).
+fn read_string_attr(attr: Option<Ref<StringAttr>>) -> String {
+    attr.map(|s| String::from((*s).clone())).unwrap_or_default()
+}
+
+/// Read an optional `BoolAttr` to a `bool` (absent → false).
+fn read_bool_attr(attr: Option<Ref<BoolAttr>>) -> bool {
+    attr.map(|b| bool::from((*b).clone())).unwrap_or(false)
+}
+
+/// LLVM mnemonic for an atomic ordering. Ordering is always present on atomic
+/// ops; `monotonic` is LLVM's weakest default if somehow absent.
+fn fmt_ordering(ord: Option<Ref<AtomicOrderingAttr>>) -> &'static str {
+    match ord.as_deref() {
+        Some(AtomicOrderingAttr::Acquire) => "acquire",
+        Some(AtomicOrderingAttr::Release) => "release",
+        Some(AtomicOrderingAttr::AcqRel) => "acq_rel",
+        Some(AtomicOrderingAttr::SeqCst) => "seq_cst",
+        Some(AtomicOrderingAttr::Monotonic) | None => "monotonic",
+    }
+}
+
+/// LLVM mnemonic for an `atomicrmw` operation.
+fn fmt_rmw_kind(kind: Option<Ref<AtomicRmwKindAttr>>) -> &'static str {
+    match kind.as_deref() {
+        Some(AtomicRmwKindAttr::Xchg) | None => "xchg",
+        Some(AtomicRmwKindAttr::Add) => "add",
+        Some(AtomicRmwKindAttr::Sub) => "sub",
+        Some(AtomicRmwKindAttr::And) => "and",
+        Some(AtomicRmwKindAttr::Nand) => "nand",
+        Some(AtomicRmwKindAttr::Or) => "or",
+        Some(AtomicRmwKindAttr::Xor) => "xor",
+        Some(AtomicRmwKindAttr::Max) => "max",
+        Some(AtomicRmwKindAttr::Min) => "min",
+        Some(AtomicRmwKindAttr::UMax) => "umax",
+        Some(AtomicRmwKindAttr::UMin) => "umin",
+        Some(AtomicRmwKindAttr::FAdd) => "fadd",
+        Some(AtomicRmwKindAttr::FSub) => "fsub",
+        Some(AtomicRmwKindAttr::FMax) => "fmax",
+        Some(AtomicRmwKindAttr::FMin) => "fmin",
+    }
+}
+
+/// Format a syncscope suffix. pliron stores syncscope as a free-form string
+/// (absent = system scope); any value passes through verbatim.
+fn fmt_syncscope(scope: Option<Ref<StringAttr>>) -> String {
+    match scope.map(|s| String::from((*s).clone())) {
+        Some(s) if !s.is_empty() => format!(" syncscope(\"{s}\")"),
+        _ => String::new(),
     }
 }

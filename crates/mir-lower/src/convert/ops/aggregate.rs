@@ -518,7 +518,7 @@ pub(crate) fn convert_extract_array_element(
 
     use dialect_llvm::ops::GepIndex;
     let gep_indices = vec![GepIndex::Constant(0), GepIndex::Value(index_val)];
-    let gep_op = llvm::GetElementPtrOp::new(ctx, array_ptr, gep_indices, llvm_array_ty.into())?;
+    let gep_op = llvm::GetElementPtrOp::new(ctx, array_ptr, gep_indices, llvm_array_ty.into());
     rewriter.insert_operation(ctx, gep_op.get_operation());
     let element_ptr = gep_op.get_operation().deref(ctx).get_result(0);
 
@@ -779,7 +779,7 @@ pub(crate) fn convert_field_addr(
     use dialect_llvm::ops::GepIndex;
     let gep_indices = vec![GepIndex::Constant(0), GepIndex::Constant(llvm_field_idx)];
 
-    let gep_op = llvm::GetElementPtrOp::new(ctx, ptr_operand, gep_indices, llvm_struct_ty)?;
+    let gep_op = llvm::GetElementPtrOp::new(ctx, ptr_operand, gep_indices, llvm_struct_ty);
     rewriter.insert_operation(ctx, gep_op.get_operation());
     rewriter.replace_operation(ctx, op, gep_op.get_operation());
 
@@ -828,7 +828,7 @@ pub(crate) fn convert_array_element_addr(
     use dialect_llvm::ops::GepIndex;
     let gep_indices = vec![GepIndex::Constant(0), GepIndex::Value(index)];
 
-    let gep_op = llvm::GetElementPtrOp::new(ctx, arr_ptr, gep_indices, llvm_array_ty)?;
+    let gep_op = llvm::GetElementPtrOp::new(ctx, arr_ptr, gep_indices, llvm_array_ty);
     rewriter.insert_operation(ctx, gep_op.get_operation());
     rewriter.replace_operation(ctx, op, gep_op.get_operation());
 

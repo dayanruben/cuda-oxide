@@ -275,10 +275,16 @@ impl MirTypeConversion for llvm_types::VectorType {
             let (elem_ty, size) = {
                 let r = ty.deref(ctx);
                 let v = r.downcast_ref::<llvm_types::VectorType>().unwrap();
-                (v.elem_type(), v.size())
+                (v.elem_type(), v.num_elements())
             };
             let llvm_elem_ty = convert_type(ctx, elem_ty)?;
-            Ok(llvm_types::VectorType::get(ctx, llvm_elem_ty, size).into())
+            Ok(llvm_types::VectorType::get(
+                ctx,
+                llvm_elem_ty,
+                size,
+                llvm_types::VectorTypeKind::Fixed,
+            )
+            .into())
         }
     }
 }

@@ -29,7 +29,7 @@ use pliron::{
 
 use crate::{
     attributes::FPHalfAttr,
-    ops::{self, FuncOp},
+    ops::{self, FuncOp, GlobalOpExt},
     types::FuncType,
 };
 
@@ -52,7 +52,7 @@ impl<'a> ModuleExportState<'a> {
 
         let name = global.get_symbol_name(self.ctx);
         let ty = global.get_type(self.ctx);
-        let address_space = global.get_address_space(self.ctx);
+        let address_space = global.address_space(self.ctx);
 
         // Check for external linkage (dynamic shared memory)
         let is_external = global
@@ -350,7 +350,7 @@ impl<'a> ModuleExportState<'a> {
                         {
                             int_attr.value().to_string_unsigned_decimal()
                         } else if let Some(fp16_attr) = val_attr.downcast_ref::<FPHalfAttr>() {
-                            format_half_literal(fp16_attr.to_bits())
+                            format_half_literal(crate::fp16_attr_to_bits(fp16_attr))
                         } else if let Some(fp32_attr) = val_attr.downcast_ref::<FPSingleAttr>() {
                             let float_val: f32 = fp32_attr.clone().into();
                             format_float_literal(f64::from(float_val))

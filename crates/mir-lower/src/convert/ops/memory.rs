@@ -51,6 +51,7 @@ use crate::context::{DeviceGlobalsMap, DynamicSmemAlignmentMap, SharedGlobalsMap
 use crate::convert::types::convert_type;
 use crate::helpers;
 use dialect_llvm::ops as llvm;
+use dialect_llvm::ops::GlobalOpExt;
 use dialect_llvm::types::ArrayType;
 use dialect_mir::types::MirPtrType;
 use pliron::builtin::op_interfaces::SymbolOpInterface;
@@ -230,7 +231,7 @@ pub(crate) fn convert_ptr_offset(
         ptr,
         vec![dialect_llvm::ops::GepIndex::Value(offset)],
         elem_ty,
-    )?;
+    );
     rewriter.insert_operation(ctx, llvm_gep.get_operation());
     rewriter.replace_operation(ctx, op, llvm_gep.get_operation());
 
@@ -605,7 +606,7 @@ pub fn convert_extern_shared_dc(
             base_ptr,
             vec![dialect_llvm::ops::GepIndex::Value(offset_value)],
             i8_ty.into(),
-        )?;
+        );
         rewriter.insert_operation(ctx, gep_op.get_operation());
         rewriter.replace_operation(ctx, op, gep_op.get_operation());
     } else {

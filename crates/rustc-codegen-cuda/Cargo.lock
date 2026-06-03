@@ -167,6 +167,7 @@ dependencies = [
  "log",
  "pliron",
  "pliron-derive",
+ "pliron-llvm",
  "reserved-oxide-symbols",
  "rustc-hash",
  "thiserror",
@@ -352,8 +353,7 @@ dependencies = [
 
 [[package]]
 name = "pliron"
-version = "0.14.0"
-source = "git+https://github.com/vaivaswatha/pliron?rev=b51e73b11648508188184451adebdcf63957b7fe#b51e73b11648508188184451adebdcf63957b7fe"
+version = "0.15.0"
 dependencies = [
  "awint",
  "combine",
@@ -374,8 +374,7 @@ dependencies = [
 
 [[package]]
 name = "pliron-derive"
-version = "0.14.0"
-source = "git+https://github.com/vaivaswatha/pliron?rev=b51e73b11648508188184451adebdcf63957b7fe#b51e73b11648508188184451adebdcf63957b7fe"
+version = "0.15.0"
 dependencies = [
  "combine",
  "convert_case",
@@ -383,6 +382,17 @@ dependencies = [
  "quote",
  "rustc-hash",
  "syn",
+]
+
+[[package]]
+name = "pliron-llvm"
+version = "0.15.0"
+dependencies = [
+ "bitflags",
+ "log",
+ "pliron",
+ "rustc-hash",
+ "thiserror",
 ]
 
 [[package]]

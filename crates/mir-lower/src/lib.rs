@@ -278,7 +278,10 @@ pub fn lower_mir_to_llvm(ctx: &mut Context, module_op: Ptr<Operation>) -> Result
         device_globals: HashMap::new(),
         dynamic_smem_alignments: HashMap::new(),
     };
-    apply_dialect_conversion(ctx, &mut conversion, module_op)
+    // pliron's DialectConversion now reports an IRStatus (Changed/Unchanged);
+    // lowering only cares about success, so discard it.
+    apply_dialect_conversion(ctx, &mut conversion, module_op)?;
+    Ok(())
 }
 
 /// Register the `dialect-mir` → `dialect-llvm` lowering pass with a pliron context.

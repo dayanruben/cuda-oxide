@@ -111,7 +111,7 @@ pub(crate) fn convert_float(
     let llvm_const = match float_attr {
         FloatAttr::F16(attr) => llvm::ConstantOp::new(
             ctx,
-            dialect_llvm::attributes::FPHalfAttr::from_bits(attr.to_bits()).into(),
+            dialect_llvm::fp16_attr_from_bits(attr.to_bits()).into(),
         ),
         FloatAttr::F32(attr) => llvm::ConstantOp::new(ctx, attr.into()),
         FloatAttr::F64(attr) => llvm::ConstantOp::new(ctx, attr.into()),

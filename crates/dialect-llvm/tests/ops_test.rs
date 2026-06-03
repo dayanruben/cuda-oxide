@@ -22,7 +22,6 @@ use pliron::{
 #[test]
 fn test_llvm_control_flow_verify() {
     let mut ctx = Context::new();
-    dialect_llvm::register(&mut ctx);
 
     let i32_ty = IntegerType::get(&mut ctx, 32, Signedness::Signless);
     let i1_ty = IntegerType::get(&mut ctx, 1, Signedness::Signless);
@@ -75,7 +74,6 @@ fn test_llvm_control_flow_verify() {
 #[test]
 fn test_llvm_arithmetic_verify() {
     let mut ctx = Context::new();
-    dialect_llvm::register(&mut ctx);
 
     let i32_ty = IntegerType::get(&mut ctx, 32, Signedness::Signless);
     let _block = BasicBlock::new(&mut ctx, None, vec![i32_ty.into(), i32_ty.into()]);
@@ -88,7 +86,6 @@ fn test_llvm_arithmetic_verify() {
                             name: &str,
                             needs_flags: bool| {
         let mut context = Context::new();
-        dialect_llvm::register(&mut context);
         let ty = IntegerType::get(&mut context, 32, Signedness::Signless);
         let blk = BasicBlock::new(&mut context, None, vec![ty.into(), ty.into()]);
         let l = blk.deref(&context).get_argument(0);
@@ -184,7 +181,6 @@ fn test_llvm_arithmetic_verify() {
 #[test]
 fn test_llvm_misc_verify() {
     let mut ctx = Context::new();
-    dialect_llvm::register(&mut ctx);
 
     let i32_ty = IntegerType::get(&mut ctx, 32, Signedness::Signless);
     let i64_ty = IntegerType::get(&mut ctx, 64, Signedness::Signless);

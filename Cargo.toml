@@ -37,10 +37,14 @@ repository = "https://github.com/NVlabs/cuda-oxide.git"
 
 [workspace.dependencies]
 # Pliron MLIR framework
-# Pinned to avoid breakage when upstream `main` moves. Bump deliberately and
-# keep `crates/rustc-codegen-cuda/Cargo.toml` on the same rev.
-pliron = { git = "https://github.com/vaivaswatha/pliron", rev = "b51e73b11648508188184451adebdcf63957b7fe" }
-pliron-derive = { git = "https://github.com/vaivaswatha/pliron", rev = "b51e73b11648508188184451adebdcf63957b7fe" }
+# TEMP (pliron-llvm migration): local path dep to the `cuda-oxide-llvm-additions`
+# branch in ../../dev/pliron for fast iteration. Flip back to a fork git-rev
+# (keeping `crates/rustc-codegen-cuda/Cargo.toml` on the same rev) before
+# committing. pliron-llvm uses default-features = false to keep llvm-sys (LLVM
+# 22) out; cuda-oxide consumes the dialect modeling only, not the FFI bridge.
+pliron = { path = "/home/nihalp/dev/pliron" }
+pliron-derive = { path = "/home/nihalp/dev/pliron/pliron-derive" }
+pliron-llvm = { path = "/home/nihalp/dev/pliron/pliron-llvm", default-features = false }
 
 # Internal crates
 dialect-llvm = { path = "crates/dialect-llvm" }

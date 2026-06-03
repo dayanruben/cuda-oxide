@@ -25,6 +25,7 @@
 
 use crate::convert::intrinsics::common::*;
 use dialect_llvm::ops as llvm;
+use dialect_llvm::ops::InlineAsmOpExt;
 use dialect_llvm::types as llvm_types;
 use pliron::builtin::types::{IntegerType, Signedness};
 use pliron::context::{Context, Ptr};

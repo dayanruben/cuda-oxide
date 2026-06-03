@@ -10,6 +10,7 @@ description = "LLVM dialect for Pliron IR framework"
 [dependencies]
 pliron = { workspace = true }
 pliron-derive = { workspace = true }
+pliron-llvm = { workspace = true }
 thiserror = { workspace = true }
 linkme = { workspace = true }
 rustc-hash = { workspace = true }
