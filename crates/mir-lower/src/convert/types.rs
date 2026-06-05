@@ -3,21 +3,21 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Type conversion from `dialect-mir` types to `dialect-llvm` types.
+//! Type conversion from `dialect-mir` types to LLVM dialect types.
 //!
 //! This module handles the translation of `dialect-mir` type representations
-//! to their `dialect-llvm` equivalents. Type conversion is foundational to
+//! to their LLVM dialect equivalents. Type conversion is foundational to
 //! the lowering pass—most operation converters depend on it.
 //!
 //! # Overview
 //!
 //! `dialect-mir` types are high-level, Rust-like types that preserve semantic
-//! information (signedness, slice semantics, etc.). `dialect-llvm` types are
+//! information (signedness, slice semantics, etc.). LLVM dialect types are
 //! lower-level and match LLVM IR types directly.
 //!
 //! # Type Mapping Table
 //!
-//! | `dialect-mir` Type              | `dialect-llvm` Type               | Notes                       |
+//! | `dialect-mir` Type              | LLVM dialect Type                 | Notes                       |
 //! |---------------------------------|-----------------------------------|-----------------------------|
 //! | `IntegerType` (signed/unsigned) | `IntegerType` (signless)          | Width preserved             |
 //! | `MirFP16Type`                   | `HalfType`                        | Rust `f16` → LLVM `half`    |
@@ -86,8 +86,9 @@
 //!
 //! This matches the C ABI for GPU kernels.
 
-use dialect_llvm::types as llvm_types;
 use dialect_mir::types::{MirDisjointSliceType, MirSliceType, MirStructType};
+use llvm_export::types as llvm_types;
+use llvm_export::types::PointerTypeExt;
 use pliron::builtin::type_interfaces::FunctionTypeInterface;
 use pliron::builtin::types::{FP32Type, FP64Type, FunctionType, IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
@@ -165,7 +166,7 @@ pub fn is_zero_sized_type(ctx: &Context, ty: Ptr<TypeObj>) -> bool {
 // Type Conversion
 // =============================================================================
 
-/// Convert a `dialect-mir` type to its `dialect-llvm` equivalent.
+/// Convert a `dialect-mir` type to its LLVM dialect equivalent.
 ///
 /// Dispatches via `MirTypeConversion` type interface — each supported type
 /// registers a converter function pointer through `#[type_interface_impl]`

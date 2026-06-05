@@ -51,7 +51,7 @@ impl<'a> ModuleExportState<'a> {
             self.export_type(array_ty.elem_type(), output)?;
             write!(output, "]").unwrap();
         } else if let Some(vec_ty) = ty_ref.downcast_ref::<crate::types::VectorType>() {
-            write!(output, "<{} x ", vec_ty.size()).unwrap();
+            write!(output, "<{} x ", vec_ty.num_elements()).unwrap();
             self.export_type(vec_ty.elem_type(), output)?;
             write!(output, ">").unwrap();
         } else {

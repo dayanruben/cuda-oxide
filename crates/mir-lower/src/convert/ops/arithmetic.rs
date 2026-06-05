@@ -3,10 +3,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Arithmetic operation conversion: `dialect-mir` → `dialect-llvm`.
+//! Arithmetic operation conversion: `dialect-mir` → LLVM dialect.
 //!
 //! Converts `dialect-mir` arithmetic, bitwise, and comparison operations to
-//! their `dialect-llvm` equivalents.
+//! their LLVM dialect equivalents.
 //!
 //! # Operations
 //!
@@ -28,11 +28,11 @@
 //! - Checked operations return `(result, overflow_flag)` tuples
 
 use crate::convert::types::convert_type;
-use dialect_llvm::attributes::{
+use llvm_export::attributes::{
     FCmpPredicateAttr, FastmathFlagsAttr, ICmpPredicateAttr, IntegerOverflowFlagsAttr,
 };
-use dialect_llvm::op_interfaces::{BinArithOp, CastOpInterface, IntBinArithOpWithOverflowFlag};
-use dialect_llvm::ops as llvm;
+use llvm_export::op_interfaces::{BinArithOp, CastOpInterface, IntBinArithOpWithOverflowFlag};
+use llvm_export::ops as llvm;
 use pliron::builtin::attributes::IntegerAttr;
 use pliron::builtin::types::{FP32Type, FP64Type, IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
@@ -63,7 +63,7 @@ fn get_binary_operands(op: Ptr<Operation>, ctx: &Context) -> Result<(Value, Valu
 /// Check if a value has floating-point type.
 fn is_float_type(ctx: &Context, val: Value) -> bool {
     let ty = val.get_type(ctx);
-    ty.deref(ctx).is::<dialect_llvm::types::HalfType>()
+    ty.deref(ctx).is::<llvm_export::types::HalfType>()
         || ty.deref(ctx).is::<FP32Type>()
         || ty.deref(ctx).is::<FP64Type>()
 }
@@ -379,7 +379,7 @@ pub(crate) fn convert_shl(
         let shl_op = llvm::ShlOp::new(ctx, lhs, rhs);
         let flags = IntegerOverflowFlagsAttr::default();
         shl_op.get_operation().deref_mut(ctx).attributes.set(
-            dialect_llvm::op_interfaces::ATTR_KEY_INTEGER_OVERFLOW_FLAGS.clone(),
+            llvm_export::op_interfaces::ATTR_KEY_INTEGER_OVERFLOW_FLAGS.clone(),
             flags,
         );
         shl_op.get_operation()
@@ -631,7 +631,13 @@ pub(crate) fn convert_cmp(
     let (lhs, rhs) = get_binary_operands(op, ctx)?;
 
     let llvm_op = if is_float_type(ctx, lhs) {
-        llvm::FCmpOp::new(ctx, float_pred, lhs, rhs).get_operation()
+        // Upstream FCmpOp carries the FastMathFlags interface, whose verifier
+        // requires the `llvm_fast_math_flags` attribute to be present (it is
+        // not set by `FCmpOp::new`). Attach default flags, as the float
+        // arithmetic ops do.
+        let fcmp = llvm::FCmpOp::new(ctx, float_pred, lhs, rhs).get_operation();
+        add_fastmath_flags(ctx, fcmp);
+        fcmp
     } else {
         let pred = if is_signed_int_op(ctx, op, operands_info)? {
             signed_pred

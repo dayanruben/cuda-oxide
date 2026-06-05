@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Call operation conversion: `dialect-mir` → `dialect-llvm`.
+//! Call operation conversion: `dialect-mir` → LLVM dialect.
 //!
 //! Handles function call lowering with ABI-level transformations:
 //! - Slice arguments flattened to (ptr, len) pairs
@@ -65,12 +65,13 @@ use crate::convert::types::{
     convert_function_type, convert_type, is_kernel_func, is_zero_sized_type,
 };
 use crate::helpers;
-use dialect_llvm::op_interfaces::CastOpInterface;
-use dialect_llvm::ops as llvm;
-use dialect_llvm::types as llvm_types;
 use dialect_mir::ops::{MirCallOp, MirFuncOp};
 use dialect_mir::rust_intrinsics;
 use dialect_mir::types::{MirDisjointSliceType, MirSliceType, MirStructType, MirTupleType};
+use llvm_export::op_interfaces::CastOpInterface;
+use llvm_export::ops as llvm;
+use llvm_export::types as llvm_types;
+use llvm_export::types::PointerTypeExt;
 use pliron::builtin::attributes::IntegerAttr;
 use pliron::builtin::op_interfaces::{CallOpCallable, SymbolOpInterface};
 use pliron::builtin::type_interfaces::FunctionTypeInterface;
@@ -961,7 +962,8 @@ fn coerce_arg_to_param_ty(
         if let (Some(src_as), Some(dst_as)) = (arg_addrspace, expected_addrspace)
             && src_as != dst_as
         {
-            let cast_op = llvm::AddrSpaceCastOp::new(ctx, arg, dst_as);
+            let cast_ty = llvm_types::PointerType::get(ctx, dst_as).into();
+            let cast_op = llvm::AddrSpaceCastOp::new(ctx, arg, cast_ty);
             rewriter.insert_operation(ctx, cast_op.get_operation());
             let casted_val = cast_op.get_operation().deref(ctx).get_result(0);
             return Ok((casted_val, expected_ty));
@@ -974,7 +976,8 @@ fn coerce_arg_to_param_ty(
     if let Some(addrspace) = arg_addrspace
         && addrspace != ADDRSPACE_GENERIC
     {
-        let cast_op = llvm::AddrSpaceCastOp::new(ctx, arg, ADDRSPACE_GENERIC);
+        let cast_ty = llvm_types::PointerType::get(ctx, ADDRSPACE_GENERIC).into();
+        let cast_op = llvm::AddrSpaceCastOp::new(ctx, arg, cast_ty);
         rewriter.insert_operation(ctx, cast_op.get_operation());
         let casted_val = cast_op.get_operation().deref(ctx).get_result(0);
         let generic_ptr_ty = llvm_types::PointerType::get_generic(ctx);

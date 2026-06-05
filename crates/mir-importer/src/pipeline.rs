@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Compilation pipeline: MIR → `dialect-mir` → `dialect-llvm` → LLVM IR → PTX.
+//! Compilation pipeline: MIR → `dialect-mir` → LLVM dialect → LLVM IR → PTX.
 //!
 //! Orchestrates the full compilation flow from collected MIR functions to
 //! executable PTX code.
@@ -14,7 +14,7 @@
 //! ┌────────────┐  ┌────────────┐  ┌───────────┐  ┌────────────────┐  ┌────────────┐
 //! │ 1. Trans-  │─▶│ 2. Verify  │─▶│ 3. mem2reg│─▶│  4. Lower      │─▶│ 5. Export  │
 //! │    late to │  │ dialect-mir│  │   (slots  │  │ dialect-mir →  │  │ LLVM IR    │
-//! │ dialect-mir│  │            │  │    → SSA) │  │  dialect-llvm  │  │ → PTX (llc)│
+//! │ dialect-mir│  │            │  │    → SSA) │  │  LLVM dialect  │  │ → PTX (llc)│
 //! └────────────┘  └────────────┘  └───────────┘  └────────────────┘  └────────────┘
 //! ```
 //!
@@ -95,14 +95,14 @@ pub struct DeviceExternAttrs {
     pub is_readonly: bool,
 }
 
-// Implement AsDeviceExtern trait for dialect-llvm integration
-impl dialect_llvm::export::AsDeviceExtern for DeviceExternDecl {
-    fn as_device_extern(&self) -> dialect_llvm::export::DeviceExternDecl {
-        dialect_llvm::export::DeviceExternDecl {
+// Implement AsDeviceExtern trait for llvm-export integration
+impl llvm_export::export::AsDeviceExtern for DeviceExternDecl {
+    fn as_device_extern(&self) -> llvm_export::export::DeviceExternDecl {
+        llvm_export::export::DeviceExternDecl {
             export_name: self.export_name.clone(),
             param_types: self.param_types.clone(),
             return_type: self.return_type.clone(),
-            attrs: dialect_llvm::export::DeviceExternAttrs {
+            attrs: llvm_export::export::DeviceExternAttrs {
                 is_convergent: self.attrs.is_convergent,
                 is_pure: self.attrs.is_pure,
                 is_readonly: self.attrs.is_readonly,
@@ -156,7 +156,7 @@ pub struct PipelineConfig {
     pub verbose: bool,
     /// Dump the `dialect-mir` module after translation (for debugging).
     pub show_mir_dialect: bool,
-    /// Dump the `dialect-llvm` module after lowering (for debugging).
+    /// Dump the LLVM dialect module after lowering (for debugging).
     pub show_llvm_dialect: bool,
     /// Emit NVVM IR suitable for libNVVM or other NVVM-compatible tools.
     ///
@@ -191,13 +191,13 @@ impl Default for PipelineConfig {
 ///
 /// # Pipeline Steps
 ///
-/// 1. Register the `dialect-mir`, `dialect-nvvm`, and `dialect-llvm` dialects
+/// 1. Register the `dialect-mir`, `dialect-nvvm`, and LLVM dialects
 /// 2. Translate each function's MIR body into `dialect-mir`
 /// 3. Verify the `dialect-mir` module
 /// 4. Run `pliron::opts::mem2reg` to promote slot allocas back into SSA
-/// 5. Lower `dialect-mir` → `dialect-llvm` (via `mir-lower`)
-/// 6. Verify the `dialect-llvm` module
-/// 7. Export `dialect-llvm` to a `.ll` file (including device extern declarations)
+/// 5. Lower `dialect-mir` → LLVM dialect (via `mir-lower`)
+/// 6. Verify the LLVM dialect module
+/// 7. Export the LLVM dialect to a `.ll` file (including device extern declarations)
 /// 8. Invoke `llc` to generate PTX (or emit LTOIR/NVVM IR when requested)
 ///
 /// # Target Selection
@@ -302,12 +302,16 @@ pub fn run_pipeline(
     // Step 4.5: Run mem2reg (promote `mir.alloca` + `mir.load`/`mir.store`
     // chains back to SSA values). This erases every promotable alloca and
     // replaces each load with the reaching definition, leaving the subsequent
-    // `dialect-mir` → `dialect-llvm` lowering to handle only genuinely
+    // `dialect-mir` → LLVM dialect lowering to handle only genuinely
     // address-taken locals.
     if config.verbose {
         eprintln!("\n=== Running mem2reg ===");
     }
-    pliron::opts::mem2reg::mem2reg(module_op_ptr, &mut ctx).map_err(|e| {
+    // pliron's pass infra now threads an AnalysisManager through mem2reg
+    // (caches dominator trees etc.); we run it standalone, so a fresh empty
+    // manager suffices. The returned IRStatus (Changed/Unchanged) is discarded.
+    let mut analyses = pliron::pass_manager::AnalysisManager::default();
+    pliron::opts::mem2reg::mem2reg(module_op_ptr, &mut ctx, &mut analyses).map_err(|e| {
         PipelineError::Verification {
             name: "mem2reg".to_string(),
             message: e.disp(&ctx).to_string(),
@@ -323,13 +327,13 @@ pub fn run_pipeline(
     }
     verify_operation(&ctx, module_op_ptr, "module post-mem2reg")?;
 
-    // Step 5: Lower dialect-mir → dialect-llvm.
+    // Step 5: Lower dialect-mir → LLVM dialect.
     if config.verbose {
-        eprintln!("\n=== Lowering dialect-mir → dialect-llvm ===");
+        eprintln!("\n=== Lowering dialect-mir → LLVM dialect ===");
     }
     lower_to_llvm(&mut ctx, module_op_ptr)?;
 
-    // Step 5.5: Add device extern declarations to the dialect-llvm module.
+    // Step 5.5: Add device extern declarations to the LLVM dialect module.
     // These are needed before verification so calls to extern functions are valid.
     if !device_externs.is_empty() {
         if config.verbose {
@@ -341,18 +345,18 @@ pub fn run_pipeline(
         add_device_extern_declarations(&mut ctx, module_op_ptr, device_externs)?;
     }
 
-    // Step 6: Verify the dialect-llvm module. Dump BEFORE verify so
+    // Step 6: Verify the LLVM dialect module. Dump BEFORE verify so
     // verification failures still surface the IR to the user.
     if config.show_llvm_dialect {
-        eprintln!("\n=== dialect-llvm (pre-verify) ===");
+        eprintln!("\n=== LLVM dialect (pre-verify) ===");
         eprintln!("{}", module_op_ptr.deref(&ctx).disp(&ctx));
     }
     if config.verbose {
-        eprintln!("=== Verifying dialect-llvm module ===");
+        eprintln!("=== Verifying LLVM dialect module ===");
     }
     verify_operation(&ctx, module_op_ptr, "llvm module")?;
     if config.verbose {
-        eprintln!("dialect-llvm verification successful ✓");
+        eprintln!("LLVM dialect verification successful ✓");
     }
 
     // Detect CUDA libdevice usage.
@@ -453,13 +457,13 @@ fn module_uses_libdevice(ctx: &Context, module_op_ptr: Ptr<Operation>) -> bool {
 
 /// Recursively scan for declared or called CUDA libdevice functions.
 fn op_uses_libdevice(ctx: &Context, op_ptr: Ptr<Operation>) -> bool {
-    if let Some(func) = Operation::get_op::<dialect_llvm::ops::FuncOp>(op_ptr, ctx)
+    if let Some(func) = Operation::get_op::<llvm_export::ops::FuncOp>(op_ptr, ctx)
         && func.get_symbol_name(ctx).starts_with("__nv_")
     {
         return true;
     }
 
-    if let Some(call) = Operation::get_op::<dialect_llvm::ops::CallOp>(op_ptr, ctx)
+    if let Some(call) = Operation::get_op::<llvm_export::ops::CallOp>(op_ptr, ctx)
         && let CallOpCallable::Direct(callee) = call.callee(ctx)
         && callee.to_string().starts_with("__nv_")
     {
@@ -518,22 +522,22 @@ fn append_to_module(ctx: &Context, module_op_ptr: Ptr<Operation>, func_op_ptr: P
     func_op_ptr.insert_at_back(block, ctx);
 }
 
-/// Lowers `dialect-mir` operations to `dialect-llvm`.
+/// Lowers `dialect-mir` operations to the LLVM dialect.
 ///
-/// Registers `dialect-llvm` and runs `mir-lower`'s `DialectConversion`-based
-/// pass, which converts each `dialect-mir`/`dialect-nvvm` op to its
-/// `dialect-llvm` equivalent.
+/// Runs `mir-lower`'s `DialectConversion`-based pass, which converts each
+/// `dialect-mir`/`dialect-nvvm` op to its LLVM dialect equivalent. The LLVM
+/// dialect auto-registers when the `Context` is created, so no explicit
+/// registration is needed here.
 fn lower_to_llvm(ctx: &mut Context, module_op_ptr: Ptr<Operation>) -> Result<(), PipelineError> {
-    dialect_llvm::register(ctx);
     mir_lower::register(ctx);
 
     mir_lower::lower_mir_to_llvm(ctx, module_op_ptr)
         .map_err(|e| PipelineError::Lowering(e.to_string()))
 }
 
-/// Adds device extern function declarations to the `dialect-llvm` module.
+/// Adds device extern function declarations to the LLVM dialect module.
 ///
-/// Creates `dialect-llvm` `FuncOp` declarations (without bodies) for each
+/// Creates LLVM dialect `FuncOp` declarations (without bodies) for each
 /// device extern function. These declarations ensure that calls to extern
 /// functions pass verification; the matching `declare` statements with
 /// attributes are emitted during LLVM IR export.
@@ -542,8 +546,8 @@ fn add_device_extern_declarations(
     module_op_ptr: Ptr<Operation>,
     device_externs: &[DeviceExternDecl],
 ) -> Result<(), PipelineError> {
-    use dialect_llvm::ops::FuncOp;
-    use dialect_llvm::types::{FuncType, VoidType};
+    use llvm_export::ops::FuncOp;
+    use llvm_export::types::{FuncType, VoidType};
     use pliron::identifier::Identifier;
 
     // Get the module's block pointer first (this is a Ptr, not a Ref, so no borrow issues)
@@ -593,13 +597,13 @@ fn add_device_extern_declarations(
 
 /// Convert LLVM type string to pliron type.
 fn llvm_type_string_to_pliron(ctx: &mut Context, type_str: &str) -> Ptr<pliron::r#type::TypeObj> {
-    use dialect_llvm::types::PointerType;
+    use llvm_export::types::PointerType;
     use pliron::builtin::types::{FP32Type, FP64Type, IntegerType, Signedness};
 
     match type_str {
         "float" => FP32Type::get(ctx).into(),
         "double" => FP64Type::get(ctx).into(),
-        "half" => dialect_llvm::types::HalfType::get(ctx).into(),
+        "half" => llvm_export::types::HalfType::get(ctx).into(),
         "i1" => IntegerType::get(ctx, 1, Signedness::Signless).into(),
         "i8" => IntegerType::get(ctx, 8, Signedness::Signless).into(),
         "i16" => IntegerType::get(ctx, 16, Signedness::Signless).into(),
@@ -610,7 +614,7 @@ fn llvm_type_string_to_pliron(ctx: &mut Context, type_str: &str) -> Ptr<pliron::
     }
 }
 
-/// Exports a `dialect-llvm` module to textual LLVM IR (`.ll` file).
+/// Exports an LLVM dialect module to textual LLVM IR (`.ll` file).
 ///
 /// Backend configuration is selected based on flags:
 /// - `emit_nvvm_ir`: Uses `NvvmExportConfig` for NVVM IR output
@@ -628,12 +632,12 @@ fn export_llvm_ir(
         .ok_or_else(|| PipelineError::Export("Not a module op".to_string()))?;
 
     let llvm_ir = if emit_nvvm_ir {
-        let config = dialect_llvm::export::NvvmExportConfig;
-        dialect_llvm::export::export_module_with_externs(ctx, &module_op, device_externs, &config)
+        let config = llvm_export::export::NvvmExportConfig;
+        llvm_export::export::export_module_with_externs(ctx, &module_op, device_externs, &config)
             .map_err(PipelineError::Export)?
     } else {
-        let config = dialect_llvm::export::PtxExportConfig;
-        dialect_llvm::export::export_module_with_externs(ctx, &module_op, device_externs, &config)
+        let config = llvm_export::export::PtxExportConfig;
+        llvm_export::export::export_module_with_externs(ctx, &module_op, device_externs, &config)
             .map_err(PipelineError::Export)?
     };
 
@@ -1017,7 +1021,7 @@ impl std::error::Error for PipelineError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dialect_llvm::export::AsDeviceExtern;
+    use llvm_export::export::AsDeviceExtern;
     use std::{fs, path::PathBuf};
 
     fn write_temp_ll(name: &str, contents: &str) -> PathBuf {
@@ -1112,18 +1116,17 @@ mod tests {
         assert_eq!(select_target(DetectedFeatures::Basic), "sm_80");
     }
 
-    /// Build a minimal `dialect-llvm` module containing a single function
+    /// Build a minimal LLVM dialect module containing a single function
     /// declaration named `name`. The module is intentionally empty otherwise;
     /// the auto-detect logic only inspects the symbol name on declarations
     /// and on direct call sites.
     fn build_module_with_func_decl(ctx: &mut Context, name: &str) -> Ptr<Operation> {
-        use dialect_llvm::ops::FuncOp as LlvmFuncOp;
-        use dialect_llvm::types::FuncType as LlvmFuncType;
+        use llvm_export::ops::FuncOp as LlvmFuncOp;
+        use llvm_export::types::FuncType as LlvmFuncType;
         use pliron::basic_block::BasicBlock;
         use pliron::builtin::ops::ModuleOp;
         use pliron::builtin::types::{IntegerType, Signedness};
 
-        dialect_llvm::register(ctx);
         let module = ModuleOp::new(ctx, "test_module".try_into().unwrap());
         let module_ptr = module.get_operation();
         let module_region = module_ptr.deref(ctx).get_region(0);
@@ -1187,14 +1190,13 @@ mod tests {
     /// `CallOp` even when no enclosing `FuncOp` matches the prefix rule.
     #[test]
     fn test_module_uses_libdevice_detects_direct_nv_call() {
-        use dialect_llvm::ops::CallOp as LlvmCallOp;
-        use dialect_llvm::types::FuncType as LlvmFuncType;
+        use llvm_export::ops::CallOp as LlvmCallOp;
+        use llvm_export::types::FuncType as LlvmFuncType;
         use pliron::basic_block::BasicBlock;
         use pliron::builtin::ops::ModuleOp;
         use pliron::builtin::types::{IntegerType, Signedness};
 
         let mut ctx = Context::new();
-        dialect_llvm::register(&mut ctx);
 
         let module = ModuleOp::new(&mut ctx, "test_module".try_into().unwrap());
         let module_ptr = module.get_operation();

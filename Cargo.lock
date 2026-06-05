@@ -371,23 +371,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dialect-llvm"
-version = "0.1.0"
-dependencies = [
- "bitflags",
- "combine",
- "dyn-clone",
- "expect-test",
- "linkme",
- "log",
- "pliron",
- "pliron-derive",
- "reserved-oxide-symbols",
- "rustc-hash",
- "thiserror",
-]
-
-[[package]]
 name = "dialect-mir"
 version = "0.1.0"
 dependencies = [
@@ -681,6 +664,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "llvm-export"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "combine",
+ "dyn-clone",
+ "expect-test",
+ "linkme",
+ "log",
+ "pliron",
+ "pliron-derive",
+ "pliron-llvm",
+ "reserved-oxide-symbols",
+ "rustc-hash",
+ "thiserror",
+]
+
+[[package]]
 name = "log"
 version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -703,10 +704,10 @@ name = "mir-importer"
 version = "0.1.0"
 dependencies = [
  "combine",
- "dialect-llvm",
  "dialect-mir",
  "dialect-nvvm",
  "linkme",
+ "llvm-export",
  "mir-lower",
  "once_cell",
  "pliron",
@@ -719,9 +720,9 @@ name = "mir-lower"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "dialect-llvm",
  "dialect-mir",
  "dialect-nvvm",
+ "llvm-export",
  "pliron",
  "pliron-derive",
  "reserved-oxide-symbols",
@@ -785,8 +786,8 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pliron"
-version = "0.14.0"
-source = "git+https://github.com/vaivaswatha/pliron?rev=b51e73b11648508188184451adebdcf63957b7fe#b51e73b11648508188184451adebdcf63957b7fe"
+version = "0.15.0"
+source = "git+https://github.com/pliron-org/pliron?rev=fed4e6f848bd726a4f2deb51c5021760ef382aec#fed4e6f848bd726a4f2deb51c5021760ef382aec"
 dependencies = [
  "awint",
  "combine",
@@ -807,8 +808,8 @@ dependencies = [
 
 [[package]]
 name = "pliron-derive"
-version = "0.14.0"
-source = "git+https://github.com/vaivaswatha/pliron?rev=b51e73b11648508188184451adebdcf63957b7fe#b51e73b11648508188184451adebdcf63957b7fe"
+version = "0.15.0"
+source = "git+https://github.com/pliron-org/pliron?rev=fed4e6f848bd726a4f2deb51c5021760ef382aec#fed4e6f848bd726a4f2deb51c5021760ef382aec"
 dependencies = [
  "combine",
  "convert_case",
@@ -816,6 +817,18 @@ dependencies = [
  "quote",
  "rustc-hash",
  "syn",
+]
+
+[[package]]
+name = "pliron-llvm"
+version = "0.15.0"
+source = "git+https://github.com/pliron-org/pliron?rev=fed4e6f848bd726a4f2deb51c5021760ef382aec#fed4e6f848bd726a4f2deb51c5021760ef382aec"
+dependencies = [
+ "bitflags",
+ "log",
+ "pliron",
+ "rustc-hash",
+ "thiserror",
 ]
 
 [[package]]

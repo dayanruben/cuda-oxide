@@ -3,10 +3,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Aggregate operation conversion: `dialect-mir` → `dialect-llvm`.
+//! Aggregate operation conversion: `dialect-mir` → LLVM dialect.
 //!
 //! Converts `dialect-mir` aggregate operations (structs, tuples, enums) to
-//! their `dialect-llvm` equivalents.
+//! their LLVM dialect equivalents.
 //!
 //! # Operations
 //!
@@ -26,11 +26,11 @@
 //! fields from all variants are flattened into a single struct.
 
 use crate::convert::types::{convert_type, is_zero_sized_type};
-use dialect_llvm::ops as llvm;
 use dialect_mir::ops::{
     MirConstructEnumOp, MirEnumPayloadOp, MirExtractFieldOp, MirFieldAddrOp, MirInsertFieldOp,
 };
 use dialect_mir::types::{MirArrayType, MirEnumType, MirPtrType, MirStructType, MirTupleType};
+use llvm_export::ops as llvm;
 use pliron::builtin::types::{IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
 use pliron::irbuild::dialect_conversion::{DialectConversionRewriter, OperandsInfo};
@@ -317,7 +317,7 @@ pub(crate) fn convert_construct_struct(
                 llvm_field_types.push(llvm_ty);
             }
         }
-        dialect_llvm::types::StructType::get_unnamed(ctx, llvm_field_types).into()
+        llvm_export::types::StructType::get_unnamed(ctx, llvm_field_types).into()
     };
 
     let undef_op = llvm::UndefOp::new(ctx, llvm_struct_ty);
@@ -393,7 +393,7 @@ pub(crate) fn convert_construct_tuple(
         }
     }
 
-    let llvm_struct_ty = dialect_llvm::types::StructType::get_unnamed(ctx, llvm_element_types);
+    let llvm_struct_ty = llvm_export::types::StructType::get_unnamed(ctx, llvm_element_types);
 
     let undef_op = llvm::UndefOp::new(ctx, llvm_struct_ty.into());
     rewriter.insert_operation(ctx, undef_op.get_operation());
@@ -452,7 +452,7 @@ pub(crate) fn convert_construct_array(
     };
 
     let llvm_element_ty = convert_type(ctx, element_ty).map_err(anyhow_to_pliron)?;
-    let llvm_array_ty = dialect_llvm::types::ArrayType::get(ctx, llvm_element_ty, array_size);
+    let llvm_array_ty = llvm_export::types::ArrayType::get(ctx, llvm_element_ty, array_size);
 
     let undef_op = llvm::UndefOp::new(ctx, llvm_array_ty.into());
     rewriter.insert_operation(ctx, undef_op.get_operation());
@@ -498,7 +498,7 @@ pub(crate) fn convert_extract_array_element(
     };
 
     let llvm_element_ty = convert_type(ctx, element_ty).map_err(anyhow_to_pliron)?;
-    let llvm_array_ty = dialect_llvm::types::ArrayType::get(ctx, llvm_element_ty, array_size);
+    let llvm_array_ty = llvm_export::types::ArrayType::get(ctx, llvm_element_ty, array_size);
 
     let i64_ty = IntegerType::get(ctx, 64, Signedness::Signless);
     let one_val = {
@@ -516,9 +516,9 @@ pub(crate) fn convert_extract_array_element(
     let store_op = llvm::StoreOp::new(ctx, array_val, array_ptr);
     rewriter.insert_operation(ctx, store_op.get_operation());
 
-    use dialect_llvm::ops::GepIndex;
+    use llvm_export::ops::GepIndex;
     let gep_indices = vec![GepIndex::Constant(0), GepIndex::Value(index_val)];
-    let gep_op = llvm::GetElementPtrOp::new(ctx, array_ptr, gep_indices, llvm_array_ty.into())?;
+    let gep_op = llvm::GetElementPtrOp::new(ctx, array_ptr, gep_indices, llvm_array_ty.into());
     rewriter.insert_operation(ctx, gep_op.get_operation());
     let element_ptr = gep_op.get_operation().deref(ctx).get_result(0);
 
@@ -580,7 +580,7 @@ pub(crate) fn convert_construct_enum(
 
     let mut llvm_field_types = vec![llvm_discriminant_ty];
     llvm_field_types.extend(llvm_payload_types);
-    let llvm_struct_ty = dialect_llvm::types::StructType::get_unnamed(ctx, llvm_field_types);
+    let llvm_struct_ty = llvm_export::types::StructType::get_unnamed(ctx, llvm_field_types);
 
     let undef_op = llvm::UndefOp::new(ctx, llvm_struct_ty.into());
     rewriter.insert_operation(ctx, undef_op.get_operation());
@@ -776,10 +776,10 @@ pub(crate) fn convert_field_addr(
 
     let llvm_struct_ty = convert_type(ctx, pointee_ty).map_err(anyhow_to_pliron)?;
 
-    use dialect_llvm::ops::GepIndex;
+    use llvm_export::ops::GepIndex;
     let gep_indices = vec![GepIndex::Constant(0), GepIndex::Constant(llvm_field_idx)];
 
-    let gep_op = llvm::GetElementPtrOp::new(ctx, ptr_operand, gep_indices, llvm_struct_ty)?;
+    let gep_op = llvm::GetElementPtrOp::new(ctx, ptr_operand, gep_indices, llvm_struct_ty);
     rewriter.insert_operation(ctx, gep_op.get_operation());
     rewriter.replace_operation(ctx, op, gep_op.get_operation());
 
@@ -825,10 +825,10 @@ pub(crate) fn convert_array_element_addr(
 
     let llvm_array_ty = convert_type(ctx, pointee_ty).map_err(anyhow_to_pliron)?;
 
-    use dialect_llvm::ops::GepIndex;
+    use llvm_export::ops::GepIndex;
     let gep_indices = vec![GepIndex::Constant(0), GepIndex::Value(index)];
 
-    let gep_op = llvm::GetElementPtrOp::new(ctx, arr_ptr, gep_indices, llvm_array_ty)?;
+    let gep_op = llvm::GetElementPtrOp::new(ctx, arr_ptr, gep_indices, llvm_array_ty);
     rewriter.insert_operation(ctx, gep_op.get_operation());
     rewriter.replace_operation(ctx, op, gep_op.get_operation());
 

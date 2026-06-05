@@ -12,11 +12,11 @@
 //! The function-pointer pattern avoids the borrow-checker conflict between
 //! `type_cast` (borrows ctx immutably) and conversion (needs `&mut ctx`).
 
-use dialect_llvm::types as llvm_types;
 use dialect_mir::types::{
     MirArrayType, MirDisjointSliceType, MirEnumType, MirFP16Type, MirPtrType, MirSliceType,
     MirStructType, MirTupleType,
 };
+use llvm_export::types as llvm_types;
 use pliron::builtin::types::{FP32Type, FP64Type, IntegerType, Signedness};
 use pliron::derive::type_interface_impl;
 
@@ -275,10 +275,16 @@ impl MirTypeConversion for llvm_types::VectorType {
             let (elem_ty, size) = {
                 let r = ty.deref(ctx);
                 let v = r.downcast_ref::<llvm_types::VectorType>().unwrap();
-                (v.elem_type(), v.size())
+                (v.elem_type(), v.num_elements())
             };
             let llvm_elem_ty = convert_type(ctx, elem_ty)?;
-            Ok(llvm_types::VectorType::get(ctx, llvm_elem_ty, size).into())
+            Ok(llvm_types::VectorType::get(
+                ctx,
+                llvm_elem_ty,
+                size,
+                llvm_types::VectorTypeKind::Fixed,
+            )
+            .into())
         }
     }
 }
