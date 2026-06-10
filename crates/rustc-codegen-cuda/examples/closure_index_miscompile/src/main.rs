@@ -78,6 +78,29 @@ impl PairNoTransparent {
     }
 }
 
+/// Out-of-line accessor reproducing the EXACT issue #120 MIR shape: its own
+/// body contains `_0 = &(((*_1).0)[_2])`, i.e. `Rvalue::Ref` of a place with
+/// projections `[Deref, Field(0), Index(_2)]`. `#[inline(never)]` keeps the
+/// shape from being dissolved by MIR opts before the importer sees it.
+#[inline(never)]
+fn node(p: &Pair, k: usize) -> &f32 {
+    &p.0[k]
+}
+
+/// Struct holding a REFERENCE to an array, so that `&h.0[k]` carries a
+/// `Deref` in the middle of the projection tail:
+/// `[Field(0), Deref, Index(k)]` (or `[Deref, Field(0), Deref, Index(k)]`
+/// when `h` is itself behind a reference). Exercises the address walker's
+/// Deref arm.
+pub struct Holder<'a>(pub &'a [f32; 2]);
+
+/// Out-of-line accessor pinning the `[Deref, Field(0), Deref, Index(k)]`
+/// projection chain in its own MIR body.
+#[inline(never)]
+fn holder_node<'a>(h: &'a Holder<'a>, k: usize) -> &'a f32 {
+    &h.0[k]
+}
+
 #[cuda_module]
 mod kernels {
     use super::*;
@@ -456,6 +479,146 @@ mod kernels {
             *slot = r1 - r0;
         }
     }
+
+    // ── Address-walker regression kernels (PR #121 hardening) ──────────
+    //
+    // The remaining kernels pin the borrow/raw-pointer address shapes that
+    // the unified `translate_place_address` walker must lower correctly:
+    // mutable write-through, ConstantIndex tails, `addr_of!` raw pointers,
+    // the exact issue #120 MIR shape, and Deref-in-the-tail projections.
+    // Each writes a diff that is `+5.0` only when the computed address
+    // points at the real element (not slot 0 and not a copy).
+
+    /// (a) `&mut local.field[k]` write-through: both lanes start EQUAL, a
+    /// `+5.0` is stored through the mutable borrow of lane `k = 1`, then
+    /// the ORIGINAL local is read back. diff = 5 only if the write landed
+    /// in the real `pair.0[1]`: a dropped index writes lane 0 (diff = -5),
+    /// a value-copy borrow writes a temporary (diff = 0).
+    #[kernel]
+    pub fn test_mut_ref_writethrough(input: &[[f32; 2]], mut out: DisjointSlice<f32>) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i >= input.len() {
+            return;
+        }
+        let base = input[i][0];
+        let mut pair = Pair([base, base]);
+        // Runtime index (data-derived so it cannot const-fold):
+        // input[0][0] == 0.0, so k == 1 at runtime.
+        let k = ((input[0][0] as usize) & 1) + 1;
+        {
+            let lane: &mut f32 = &mut pair.0[k];
+            *lane += 5.0;
+        }
+        if let Some(slot) = out.get_mut(idx) {
+            *slot = pair.0[1] - pair.0[0];
+        }
+    }
+
+    /// (b) ConstantIndex tail: `&(*pr).0[1]` with LITERAL indices, i.e.
+    /// projection `[Deref, Field(0), ConstantIndex{1}]`. The pre-#121 code
+    /// dropped this tail exactly like the runtime-Index one.
+    #[kernel]
+    pub fn test_constant_index_tail(input: &[[f32; 2]], mut out: DisjointSlice<f32>) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i >= input.len() {
+            return;
+        }
+        let pair = Pair(input[i]);
+        let pr: &Pair = &pair;
+        let r1: &f32 = &pr.0[1];
+        let r0: &f32 = &pr.0[0];
+        if let Some(slot) = out.get_mut(idx) {
+            *slot = *r1 - *r0;
+        }
+    }
+
+    /// (c) Raw-pointer reads via `core::ptr::addr_of!`: exercises the
+    /// `Rvalue::AddressOf` path (`&raw const (*pr).0[k]`) which had its own
+    /// copy of the Field-only tail walk before the hardening.
+    #[kernel]
+    pub fn test_raw_addr_of_const(input: &[[f32; 2]], mut out: DisjointSlice<f32>) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i >= input.len() {
+            return;
+        }
+        let pair = Pair(input[i]);
+        let pr: &Pair = &pair;
+        // Runtime index: input[0][0] == 0.0, so k == 0 at runtime.
+        let k = (input[0][0] as usize) & 1;
+        let p1: *const f32 = core::ptr::addr_of!(pr.0[k + 1]);
+        let p0: *const f32 = core::ptr::addr_of!(pr.0[k]);
+        let (r1, r0) = unsafe { (*p1, *p0) };
+        if let Some(slot) = out.get_mut(idx) {
+            *slot = r1 - r0;
+        }
+    }
+
+    /// (c') Raw-pointer WRITE via `core::ptr::addr_of_mut!`
+    /// (`&raw mut local[k]`): both lanes start equal, lane `k = 1` gets
+    /// `+5.0` through the raw pointer, and the original local is read back.
+    #[kernel]
+    pub fn test_raw_addr_of_mut_writethrough(input: &[[f32; 2]], mut out: DisjointSlice<f32>) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i >= input.len() {
+            return;
+        }
+        let base = input[i][0];
+        let mut acc = [base, base];
+        let k = ((input[0][0] as usize) & 1) + 1; // == 1 at runtime
+        let pm: *mut f32 = core::ptr::addr_of_mut!(acc[k]);
+        unsafe {
+            *pm += 5.0;
+        }
+        if let Some(slot) = out.get_mut(idx) {
+            *slot = acc[1] - acc[0];
+        }
+    }
+
+    /// (d) The exact issue #120 shape: an `#[inline(never)]` accessor
+    /// `fn node(p: &Pair, k: usize) -> &f32 { &p.0[k] }` whose own MIR is
+    /// `_0 = &(((*_1).0)[_2])`.
+    #[kernel]
+    pub fn test_inline_never_node_fn(input: &[[f32; 2]], mut out: DisjointSlice<f32>) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i >= input.len() {
+            return;
+        }
+        let pair = Pair(input[i]);
+        let k = (input[0][0] as usize) & 1; // == 0 at runtime
+        let r1 = *node(&pair, k + 1);
+        let r0 = *node(&pair, k);
+        if let Some(slot) = out.get_mut(idx) {
+            *slot = r1 - r0;
+        }
+    }
+
+    /// (e) Deref INSIDE the projection tail: `Holder<'a>(&'a [f32; 2])`,
+    /// so `&hr.0[k]` is `[Deref, Field(0), Deref, Index(k)]` -- the walker
+    /// must load the array reference out of the field before indexing.
+    /// Uses both the pinned `#[inline(never)]` accessor and the direct
+    /// in-kernel form.
+    #[kernel]
+    pub fn test_holder_deref_tail(input: &[[f32; 2]], mut out: DisjointSlice<f32>) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i >= input.len() {
+            return;
+        }
+        let arr: [f32; 2] = input[i];
+        let h = Holder(&arr);
+        let hr: &Holder = &h;
+        let k = (input[0][0] as usize) & 1; // == 0 at runtime
+        let r1: &f32 = &hr.0[k + 1];
+        let r0: &f32 = holder_node(hr, k);
+        if let Some(slot) = out.get_mut(idx) {
+            *slot = *r1 - *r0;
+        }
+    }
 }
 
 const N: usize = 4;
@@ -466,7 +629,9 @@ fn make_input() -> Vec<[f32; 2]> {
     (0..N).map(|i| [i as f32, i as f32 + 5.0]).collect()
 }
 
-fn run_and_report<F>(name: &str, stream: &Arc<CudaStream>, launch: F)
+/// Launches one kernel and prints its verdict. Returns `true` on PASS so
+/// `main` can track failures and exit non-zero on any mismatch.
+fn run_and_report<F>(name: &str, stream: &Arc<CudaStream>, launch: F) -> bool
 where
     F: FnOnce(&Arc<CudaStream>, LaunchConfig, &DeviceBuffer<[f32; 2]>, &mut DeviceBuffer<f32>),
 {
@@ -497,6 +662,7 @@ where
         N.min(4),
         &host_out[..N.min(4)]
     );
+    all_correct
 }
 
 fn main() {
@@ -510,12 +676,12 @@ fn main() {
     println!("Each kernel computes r1 - r0 where r0 reads arr[0] and r1 reads arr[1].");
     println!("Input designed so the correct diff is +5.0 for every element.\n");
 
-    run_and_report("test_unrolled_baseline", &stream, |s, cfg, i, o| {
-        module
-            .test_unrolled_baseline(s, cfg, i, o)
-            .expect("launch")
+    let mut all_pass = true;
+
+    all_pass &= run_and_report("test_unrolled_baseline", &stream, |s, cfg, i, o| {
+        module.test_unrolled_baseline(s, cfg, i, o).expect("launch")
     });
-    run_and_report(
+    all_pass &= run_and_report(
         "test_closure_indexes_into_array",
         &stream,
         |s, cfg, i, o| {
@@ -524,16 +690,12 @@ fn main() {
                 .expect("launch")
         },
     );
-    run_and_report(
-        "test_closure_indexes_via_match",
-        &stream,
-        |s, cfg, i, o| {
-            module
-                .test_closure_indexes_via_match(s, cfg, i, o)
-                .expect("launch")
-        },
-    );
-    run_and_report(
+    all_pass &= run_and_report("test_closure_indexes_via_match", &stream, |s, cfg, i, o| {
+        module
+            .test_closure_indexes_via_match(s, cfg, i, o)
+            .expect("launch")
+    });
+    all_pass &= run_and_report(
         "test_closure_into_struct_wrapper",
         &stream,
         |s, cfg, i, o| {
@@ -542,7 +704,7 @@ fn main() {
                 .expect("launch")
         },
     );
-    run_and_report(
+    all_pass &= run_and_report(
         "test_closure_pre_loaded_outside",
         &stream,
         |s, cfg, i, o| {
@@ -551,22 +713,22 @@ fn main() {
                 .expect("launch")
         },
     );
-    run_and_report("test_closure_node_ref_access", &stream, |s, cfg, i, o| {
+    all_pass &= run_and_report("test_closure_node_ref_access", &stream, |s, cfg, i, o| {
         module
             .test_closure_node_ref_access(s, cfg, i, o)
             .expect("launch")
     });
-    run_and_report("test_closure_with_shuffle", &stream, |s, cfg, i, o| {
+    all_pass &= run_and_report("test_closure_with_shuffle", &stream, |s, cfg, i, o| {
         module
             .test_closure_with_shuffle(s, cfg, i, o)
             .expect("launch")
     });
-    run_and_report("test_closure_two_shuffles", &stream, |s, cfg, i, o| {
+    all_pass &= run_and_report("test_closure_two_shuffles", &stream, |s, cfg, i, o| {
         module
             .test_closure_two_shuffles(s, cfg, i, o)
             .expect("launch")
     });
-    run_and_report(
+    all_pass &= run_and_report(
         "test_two_shuffles_no_indexed_load",
         &stream,
         |s, cfg, i, o| {
@@ -575,12 +737,12 @@ fn main() {
                 .expect("launch")
         },
     );
-    run_and_report("test_two_shuffles_raw_array", &stream, |s, cfg, i, o| {
+    all_pass &= run_and_report("test_two_shuffles_raw_array", &stream, |s, cfg, i, o| {
         module
             .test_two_shuffles_raw_array(s, cfg, i, o)
             .expect("launch")
     });
-    run_and_report(
+    all_pass &= run_and_report(
         "test_two_shuffles_no_transparent",
         &stream,
         |s, cfg, i, o| {
@@ -589,12 +751,12 @@ fn main() {
                 .expect("launch")
         },
     );
-    run_and_report("test_two_shuffles_inlined", &stream, |s, cfg, i, o| {
+    all_pass &= run_and_report("test_two_shuffles_inlined", &stream, |s, cfg, i, o| {
         module
             .test_two_shuffles_inlined(s, cfg, i, o)
             .expect("launch")
     });
-    run_and_report(
+    all_pass &= run_and_report(
         "test_closure_shuffle_with_captures",
         &stream,
         |s, cfg, i, o| {
@@ -603,13 +765,48 @@ fn main() {
                 .expect("launch")
         },
     );
-    run_and_report(
-        "test_closure_via_array_literal",
+    all_pass &= run_and_report("test_closure_via_array_literal", &stream, |s, cfg, i, o| {
+        module
+            .test_closure_via_array_literal(s, cfg, i, o)
+            .expect("launch")
+    });
+
+    // Address-walker regression kernels (PR #121 hardening).
+    all_pass &= run_and_report("test_mut_ref_writethrough", &stream, |s, cfg, i, o| {
+        module
+            .test_mut_ref_writethrough(s, cfg, i, o)
+            .expect("launch")
+    });
+    all_pass &= run_and_report("test_constant_index_tail", &stream, |s, cfg, i, o| {
+        module
+            .test_constant_index_tail(s, cfg, i, o)
+            .expect("launch")
+    });
+    all_pass &= run_and_report("test_raw_addr_of_const", &stream, |s, cfg, i, o| {
+        module.test_raw_addr_of_const(s, cfg, i, o).expect("launch")
+    });
+    all_pass &= run_and_report(
+        "test_raw_addr_of_mut_writethrough",
         &stream,
         |s, cfg, i, o| {
             module
-                .test_closure_via_array_literal(s, cfg, i, o)
+                .test_raw_addr_of_mut_writethrough(s, cfg, i, o)
                 .expect("launch")
         },
     );
+    all_pass &= run_and_report("test_inline_never_node_fn", &stream, |s, cfg, i, o| {
+        module
+            .test_inline_never_node_fn(s, cfg, i, o)
+            .expect("launch")
+    });
+    all_pass &= run_and_report("test_holder_deref_tail", &stream, |s, cfg, i, o| {
+        module.test_holder_deref_tail(s, cfg, i, o).expect("launch")
+    });
+
+    if all_pass {
+        println!("\nSUCCESS: all kernels passed");
+    } else {
+        println!("\nFAILURE: at least one kernel returned a wrong diff");
+        std::process::exit(1);
+    }
 }
