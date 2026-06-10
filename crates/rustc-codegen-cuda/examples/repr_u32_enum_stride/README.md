@@ -1,4 +1,4 @@
-# `repr_u32_enum_stride` — minimal repro
+# `repr_u32_enum_stride` — enum discriminant layout repro
 
 Reads from `*const E` where `E` is a fieldless `#[repr(u32)] enum` are
 miscompiled by `rustc-codegen-cuda`: pointer arithmetic strides by
@@ -21,7 +21,7 @@ cargo oxide run repr_u32_enum_stride
 ```
 control_u32   [0, 1, 2, 3]   PASS
 enum_ptr      [0, 0, 0, 0]   FAIL
-RESULT: control and enum-path DISAGREE — bug reproduced.
+RESULT: FAIL - at least one enum shape miscompiled (see above).
 ```
 
 ## Expected output after the fix
@@ -29,7 +29,11 @@ RESULT: control and enum-path DISAGREE — bug reproduced.
 ```
 control_u32   [0, 1, 2, 3]   PASS
 enum_ptr      [0, 1, 2, 3]   PASS
-RESULT: control and enum-path agree — bug not reproduced (good!).
+repr_c_enum   [0, 1, 2, 3]   PASS
+sparse_enum   [0, 1000000, 1000000, 0]   PASS
+neg_enum      [-1, 0, -1, 0]   PASS
+usize_enum    [0, 1, 2, 3]   PASS
+RESULT: PASS - every enum shape strides and sign-extends correctly.
 ```
 
 ## Root cause and fix
@@ -41,11 +45,23 @@ variants alone. For this four-variant `#[repr(u32)]` enum, that selected an
 
 Pointer arithmetic over `*const Tag` then used the lowered enum element size,
 so `base.add(1)` advanced by 1 byte instead of 4 bytes. The fix in
-`crates/mir-importer/src/translator/types.rs` consults `AdtDef::repr().int`
-first and uses the requested integer width whenever the enum has an explicit
-integer representation. The existing variant-count heuristic remains the
-fallback for enums without an explicit integer repr.
+`crates/mir-importer/src/translator/types.rs` sources the discriminant type
+from **rustc's layout** (`rust_ty.layout()`): for `TagEncoding::Direct` enums
+the tag scalar's width and signedness are used directly. Reading the layout
+(rather than the `repr` attribute or the variant count) covers every tag
+shape with one mechanism, which is why this example also tests:
 
-`Tag` in this example is exactly the shape under test: a fieldless
-`#[repr(u32)]` enum with four variants (`Foo = 0`, `Bar = 1`, `Baz = 2`,
-`Qux = 3`) stored in a device buffer.
+| Kernel        | Enum shape                        | What must hold        |
+| :------------ | :-------------------------------- | :-------------------- |
+| `enum_ptr`    | `#[repr(u32)]`, 4 unit variants   | stride 4              |
+| `repr_c_enum` | `#[repr(C)]`, 4 unit variants     | stride 4 (C `int`)    |
+| `sparse_enum` | default repr, `B = 1_000_000`     | u32 tag, stride 4     |
+| `neg_enum`    | default repr, `N = -1`            | SIGNED i8 tag, `sext` |
+| `usize_enum`  | `#[repr(usize)]`, 4 unit variants | stride 8              |
+
+`neg_enum` is the signedness half of the bug: the old model hardcoded an
+unsigned tag, so a memory-loaded `e as i32` zero-extended the `0xFF` byte to
+`255` instead of sign-extending it to `-1`.
+
+Niched enums (e.g. `Option<&T>`) are intentionally NOT affected: their
+un-niched in-kernel model keeps the variant-count tag.

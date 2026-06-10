@@ -563,9 +563,14 @@ impl EnumVariant {
 ///
 /// Represents Rust enums like `Option<T>`, `Result<T,E>`, and custom enums.
 ///
-/// Memory layout follows Rust's enum representation:
-/// - Discriminant (integer type based on variant count)
-/// - Payload (union of all variant payloads, sized to largest)
+/// Lowered as a `{tag, variant fields...}` struct:
+/// - Discriminant tag sourced from rustc's layout (width AND signedness of
+///   the tag scalar for Direct-tag enums; a variant-count fallback for the
+///   niched / single-variant models, which are deliberately un-niched)
+/// - All variants' payload fields concatenated in declaration order (NOT
+///   overlapped like Rust's real layout). mir-lower uses `total_size` to pad
+///   the struct to rustc's size, or to reject memory traversal loudly when
+///   concatenation makes the struct larger than the Rust object.
 ///
 /// Note: For simplicity, we store variant info in flattened vectors
 /// since the `#[format_type]` macro has trouble with nested structs.
@@ -581,7 +586,10 @@ impl EnumVariant {
 pub struct MirEnumType {
     /// The enum name (e.g., "Option", "Result")
     pub name: String,
-    /// The discriminant type (usually u8, u16, or u32)
+    /// The discriminant type, sourced from rustc's layout: the tag scalar's
+    /// width and signedness for Direct-tag enums (so `#[repr(uN/iN)]`,
+    /// `#[repr(C)]`, sparse and negative discriminants are all honoured); a
+    /// variant-count fallback for the niched / single-variant models.
     pub discriminant_ty: Ptr<TypeObj>,
     /// Variant names in order
     pub variant_names: Vec<String>,

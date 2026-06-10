@@ -67,14 +67,18 @@
 //!
 //! # Enum Type Representation
 //!
-//! Rust enums are represented as structs with discriminant + payload:
+//! Rust enums are represented as structs with the discriminant tag first,
+//! then every variant's payload fields concatenated in declaration order:
 //!
 //! ```text
 //! MIR: MirEnumType { discriminant: i8, variants: [A(), B(i32)] }
-//! LLVM: struct { i8, i32 }  ; discriminant + max payload size
+//! LLVM: struct { i8, i32 }  ; tag + concatenated variant fields
 //! ```
 //!
-//! All variant payloads are included in the struct, sized for the largest.
+//! When rustc's total size is known (Direct-tag enums), the struct is padded
+//! with a trailing `[N x i8]` to match it; multi-payload enums whose
+//! concatenation exceeds rustc's size are rejected at memory-traversal sites.
+//! See [`convert_enum_to_llvm`].
 //!
 //! # Function Type Conversion
 //!
