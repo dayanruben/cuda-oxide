@@ -45,6 +45,11 @@ mod kernels {
 
     /// Integer case. Each thread evaluates all three unwrap_or results
     /// and writes the one selected by `tid % 3`.
+    ///
+    /// The literal `Some`/`None` + `unwrap_or` shapes are the test
+    /// subject: -O const-folds them into provenance-carrying pointer
+    /// constants, the exact pattern issue #132 miscompiled.
+    #[allow(clippy::unnecessary_literal_unwrap)]
     #[kernel]
     pub fn opt_ref_unwrap_or_u32(mut out: DisjointSlice<u32>) {
         let tid = thread::index_1d();
@@ -66,6 +71,7 @@ mod kernels {
     }
 
     /// Float case: same shape with an `&f32` literal default.
+    #[allow(clippy::unnecessary_literal_unwrap)]
     #[kernel]
     pub fn opt_ref_unwrap_or_f32(mut out: DisjointSlice<f32>) {
         let tid = thread::index_1d();
@@ -76,7 +82,7 @@ mod kernels {
             let b: Option<&f32> = None;
             let v0: f32 = *a.unwrap_or(&2.5); // Some path: 1.5
             let v1: f32 = *b.unwrap_or(&2.5); // None path, literal default: 2.5
-            *out_elem = if i % 2 == 0 { v0 } else { v1 };
+            *out_elem = if i.is_multiple_of(2) { v0 } else { v1 };
         }
     }
 }
@@ -90,7 +96,7 @@ fn expected_u32(i: usize) -> u32 {
 }
 
 fn expected_f32(i: usize) -> f32 {
-    if i % 2 == 0 { 1.5 } else { 2.5 }
+    if i.is_multiple_of(2) { 1.5 } else { 2.5 }
 }
 
 fn main() {
