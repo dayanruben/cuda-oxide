@@ -1023,7 +1023,7 @@ mod tests {
         use crate::convert::types::{build_enum_slot_map, llvm_type_size_align};
 
         let mut ctx = make_ctx();
-        let e = make_divergent_enum_ty(&mut ctx);
+        let e = make_multi_payload_enum_ty(&mut ctx);
         let map = build_enum_slot_map(&mut ctx, e).unwrap();
         assert_eq!(map.tag_slot, 0);
         assert_eq!(
@@ -1077,7 +1077,7 @@ mod tests {
     /// Multi-payload enum whose variants overlap in Rust (8 bytes) but
     /// concatenate in our model (12 bytes structural): mimics
     /// `#[repr(u32)] enum E { A(u32), B(u32) }`.
-    fn make_divergent_enum_ty(ctx: &mut Context) -> Ptr<TypeObj> {
+    fn make_multi_payload_enum_ty(ctx: &mut Context) -> Ptr<TypeObj> {
         let i32_a: Ptr<TypeObj> = IntegerType::get(ctx, 32, Signedness::Unsigned).into();
         let i32_b: Ptr<TypeObj> = IntegerType::get(ctx, 32, Signedness::Unsigned).into();
         make_enum_ty(
@@ -1098,11 +1098,11 @@ mod tests {
     /// `{tag, fields...}` model sizes both the writes and the reads
     /// consistently (issue #131's in-kernel `[E; 4]` arrays). Only kernel
     /// parameters (host-laid-out memory) reject divergent enums; see
-    /// `kernel_param_rejects_layout_divergent_enum`.
+    /// `kernel_param_accepts_multi_payload_enum`.
     #[test]
-    fn device_local_divergent_enum_gep_and_load_lower() {
+    fn device_local_multi_payload_enum_gep_and_load_lower() {
         let mut ctx = make_ctx();
-        let enum_ty = make_divergent_enum_ty(&mut ctx);
+        let enum_ty = make_multi_payload_enum_ty(&mut ctx);
         let i64_ty: Ptr<TypeObj> = IntegerType::get(&mut ctx, 64, Signedness::Signless).into();
         let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, enum_ty, true);
 
@@ -1141,11 +1141,11 @@ mod tests {
     /// out with rustc's real (overlapped) layout while the device model
     /// concatenates payloads, so stride and field offsets disagree.
     #[test]
-    fn kernel_param_rejects_layout_divergent_enum() {
+    fn kernel_param_accepts_multi_payload_enum() {
         use pliron::builtin::attributes::StringAttr;
 
         let mut ctx = make_ctx();
-        let enum_ty = make_divergent_enum_ty(&mut ctx);
+        let enum_ty = make_multi_payload_enum_ty(&mut ctx);
         let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, enum_ty, false);
 
         let (module_ptr, block) = build_kernel(&mut ctx, vec![mir_ptr_ty.into()], vec![]);
@@ -1170,16 +1170,72 @@ mod tests {
                 .insert(key, kernel_attr.into());
         }
 
+        // The slot map lowers MultiPayload byte-identically to rustc's
+        // layout ({ i32, i32 }, 8 bytes), so the kernel ABI accepts it.
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr)
+            .expect("multi-payload enum kernel param must lower");
+    }
+
+    /// Niche-encoded enums (`total_size == 0`, more than one variant) keep
+    /// the deliberately un-niched device model with a synthetic tag, so
+    /// they must still be rejected at the kernel ABI boundary. This pins
+    /// the hole the narrowed guard closes: such an enum used to sail past
+    /// the old size-comparison check.
+    #[test]
+    fn kernel_param_rejects_niched_enum() {
+        use pliron::builtin::attributes::StringAttr;
+
+        let mut ctx = make_ctx();
+        // Un-niched model of Option<&T>: synthetic u8 tag, pointer payload,
+        // total_size 0 ("layout unknown"), exactly what the importer builds
+        // for TagEncoding::Niche.
+        let i32_ty: Ptr<TypeObj> = IntegerType::get(&mut ctx, 32, Signedness::Signless).into();
+        let pointee = MirPtrType::get_generic(&mut ctx, i32_ty, false);
+        let tag_ty: Ptr<TypeObj> = IntegerType::get(&mut ctx, 8, Signedness::Unsigned).into();
+        let niched: Ptr<TypeObj> = MirEnumType::get(
+            &mut ctx,
+            "Option".to_string(),
+            tag_ty,
+            vec![0, 1],
+            vec![
+                EnumVariant::unit("None".to_string()),
+                EnumVariant::new("Some".to_string(), vec![pointee.into()]),
+            ],
+        )
+        .into();
+        let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, niched, false);
+
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![mir_ptr_ty.into()], vec![]);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        {
+            let module_block = module_ptr
+                .deref(&ctx)
+                .get_region(0)
+                .deref(&ctx)
+                .iter(&ctx)
+                .next()
+                .unwrap();
+            let func_op = module_block.deref(&ctx).iter(&ctx).next().unwrap();
+            let kernel_attr = StringAttr::new("true".to_string());
+            let key: pliron::identifier::Identifier = "gpu_kernel".try_into().unwrap();
+            func_op
+                .deref_mut(&mut ctx)
+                .attributes
+                .0
+                .insert(key, kernel_attr.into());
+        }
+
         let err = crate::lower_mir_to_llvm(&mut ctx, module_ptr)
-            .expect_err("kernel param with divergent enum must be rejected");
+            .expect_err("niched enum kernel param must be rejected");
         let msg = format!("{err}");
         assert!(
-            msg.contains("MultiPayload") && msg.contains("ABI boundary"),
+            msg.contains("Option") && msg.contains("ABI boundary"),
             "error must name the enum and the ABI boundary, got: {msg}"
         );
         assert!(
-            msg.contains("not yet field-faithful"),
-            "error must state the multi-payload layout gap, got: {msg}"
+            msg.contains("niche-optimised"),
+            "error must state the unmodeled-niche gap, got: {msg}"
         );
     }
 

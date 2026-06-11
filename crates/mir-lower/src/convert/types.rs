@@ -872,67 +872,48 @@ pub(crate) fn convert_enum_to_llvm(
     Ok(build_enum_slot_map(ctx, ty)?.llvm_struct_ty)
 }
 
-/// Detect Direct-tag enums whose concatenated `{tag, fields...}` model cannot
-/// match rustc's memory layout: the structural size exceeds rustc's total
-/// size because several variants carry payloads that overlap in Rust but are
-/// concatenated in our model. Such an enum cannot be padded into shape, and
-/// traversing memory with it (GEP stride, load/store width) would silently
-/// read or write the wrong bytes, so callers reject it loudly instead.
+/// Detect enums whose device model is deliberately NOT memory-faithful:
+/// the `total_size == 0` shapes (niche-encoded enums like `Option<&T>`,
+/// and degenerate multi-syntactic-variant `Single`s like
+/// `Result<T, Infallible>`). Their un-niched device model carries a
+/// synthetic tag that does not exist in rustc's layout, so host and
+/// device disagree on every byte. Fieldless/single-variant enums with one
+/// variant are harmless (no host bytes to disagree about beyond ZST).
 ///
-/// Returns `Some(enum_name)` for a divergent enum, `None` when `ty` is not a
-/// `MirEnumType` or its layout is memory-faithful (possibly after padding).
-pub(crate) fn enum_memory_divergence(
-    ctx: &mut Context,
+/// Direct-tag enums (`total_size > 0`) are always memory-faithful now
+/// ([`build_enum_slot_map`] places every field at its rustc offset), so
+/// they pass.
+///
+/// Returns `Some(enum_name)` for an unmodeled enum, `None` otherwise.
+pub(crate) fn enum_unmodeled_in_memory(
+    ctx: &Context,
     ty: Ptr<TypeObj>,
-) -> Result<Option<String>, anyhow::Error> {
-    let info = {
-        let ty_ref = ty.deref(ctx);
-        ty_ref.downcast_ref::<MirEnumType>().map(|enum_ty| {
-            (
-                enum_ty.name().to_string(),
-                enum_ty.discriminant_ty,
-                enum_ty.all_field_types.clone(),
-                enum_ty.total_size(),
-            )
-        })
-    };
-    let Some((name, discriminant_ty, all_field_types, total_size)) = info else {
-        return Ok(None);
-    };
-    if total_size == 0 {
-        // Size unknown (niched / single-variant model): the un-niched model
-        // is deliberately self-consistent; nothing to check against.
-        return Ok(None);
-    }
-
-    let llvm_discr_ty = convert_type(ctx, discriminant_ty)?;
-    let mut llvm_fields = vec![llvm_discr_ty];
-    for field_ty in all_field_types {
-        llvm_fields.push(convert_type(ctx, field_ty)?);
-    }
-    let (_end, size, _align) = natural_struct_layout(ctx, &llvm_fields);
-
-    Ok((size > total_size).then_some(name))
+) -> Option<String> {
+    let ty_ref = ty.deref(ctx);
+    let enum_ty = ty_ref.downcast_ref::<MirEnumType>()?;
+    (enum_ty.total_size() == 0 && enum_ty.variant_count() > 1)
+        .then(|| enum_ty.name().to_string())
 }
 
-/// Find a layout-divergent enum reachable from `ty` through the kernel ABI.
+/// Find a memory-unmodeled enum reachable from `ty` through the kernel
+/// ABI.
 ///
 /// Walks the pre-conversion MIR type tree: pointer pointees, slice and
 /// array elements, struct/tuple fields, and enum payload fields. Returns
-/// the first divergent enum's name (see [`enum_memory_divergence`]), or
+/// the first unmodeled enum's name (see [`enum_unmodeled_in_memory`]), or
 /// `None` when the whole tree is memory-faithful.
 ///
 /// Used only for KERNEL signatures: a kernel parameter is laid out by the
 /// host with rustc's real layout (by value via `cuLaunchKernel`, or behind
-/// pointers/slices into `DeviceBuffer` memory), so a divergent enum there
-/// means host and device disagree on stride and field offsets. Device-local
-/// use of the same enum (locals, construct, match, loads/stores of allocas)
-/// is self-consistent because every access uses the same lowered struct
-/// type, and is deliberately NOT rejected.
+/// pointers/slices into `DeviceBuffer` memory), so an unmodeled enum there
+/// means host and device disagree on size, tag placement, and field
+/// offsets. Device-local use of the same enum (locals, construct, match,
+/// loads/stores of allocas) is self-consistent because every access uses
+/// the same lowered struct type, and is deliberately NOT rejected.
 ///
 /// `visited` breaks cycles through recursive types (`Ptr<TypeObj>` is
 /// interned, so equality is identity).
-pub(crate) fn find_divergent_enum_in_abi(
+pub(crate) fn find_unmodeled_enum_in_abi(
     ctx: &mut Context,
     ty: Ptr<TypeObj>,
     visited: &mut Vec<Ptr<TypeObj>>,
@@ -942,7 +923,7 @@ pub(crate) fn find_divergent_enum_in_abi(
     }
     visited.push(ty);
 
-    if let Some(name) = enum_memory_divergence(ctx, ty)? {
+    if let Some(name) = enum_unmodeled_in_memory(ctx, ty) {
         return Ok(Some(name));
     }
 
@@ -968,7 +949,7 @@ pub(crate) fn find_divergent_enum_in_abi(
     };
 
     for child in children {
-        if let Some(name) = find_divergent_enum_in_abi(ctx, child, visited)? {
+        if let Some(name) = find_unmodeled_enum_in_abi(ctx, child, visited)? {
             return Ok(Some(name));
         }
     }

@@ -83,11 +83,14 @@ pub fn convert_func(
 
     // Kernel parameters cross the host/device ABI boundary: the host lays
     // them out with rustc's real layout (by value via cuLaunchKernel, or
-    // behind pointers/slices into DeviceBuffer memory). A multi-payload
-    // enum whose concatenated lowering model is larger than rustc's layout
-    // would make host and device disagree on stride and field offsets, so
-    // reject it here, at the boundary. Device-local use of the same enum
-    // (locals, construct, match) is self-consistent and stays allowed.
+    // behind pointers/slices into DeviceBuffer memory). Direct-tag enums
+    // lower byte-identically to rustc's layout and pass freely. The
+    // remaining unmodeled shapes are the deliberately un-niched
+    // `total_size == 0` enums (niche-encoded like `Option<&T>`, degenerate
+    // multi-variant Singles like `Result<T, Infallible>`): their device
+    // model carries a synthetic tag rustc's layout does not have, so host
+    // and device would disagree on every byte. Reject those here, at the
+    // boundary. Device-local use (locals, construct, match) stays allowed.
     if is_kernel {
         let mir_arg_types = {
             use pliron::builtin::type_interfaces::FunctionTypeInterface;
@@ -97,15 +100,17 @@ pub fn convert_func(
         for (i, arg_ty) in mir_arg_types.iter().enumerate() {
             let mut visited = Vec::new();
             if let Some(enum_name) =
-                crate::convert::types::find_divergent_enum_in_abi(ctx, *arg_ty, &mut visited)
+                crate::convert::types::find_unmodeled_enum_in_abi(ctx, *arg_ty, &mut visited)
                     .map_err(anyhow_to_pliron)?
             {
                 return pliron::input_err_noloc!(
                     "kernel `{}` parameter {} carries enum `{}` across the host/device ABI \
-                     boundary, but its multi-payload memory layout is not yet field-faithful \
-                     (variants overlap in Rust but are concatenated in the lowering model), so \
-                     host and device would disagree on its size and field offsets. Device-local \
-                     use of `{}` (locals, construct, match) is unaffected.",
+                     boundary, but its niche-optimised (or tagless single-variant) layout is \
+                     not modelled in device memory: the device uses a synthetic tag that does \
+                     not exist in rustc's layout, so host and device would disagree on its \
+                     bytes. Use an enum with an explicit discriminant repr (e.g. #[repr(u32)]) \
+                     at the kernel boundary. Device-local use of `{}` (locals, construct, \
+                     match) is unaffected.",
                     func_name_str,
                     i,
                     enum_name,
