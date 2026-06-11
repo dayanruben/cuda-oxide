@@ -889,14 +889,26 @@ pub fn translate_type(
         // `str` is an unsized byte sequence (appears in dead panic-message
         // branches). Translate as a `[u8]`-style slice.
         rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Str) => {
-            let u8_ty = pliron::builtin::types::IntegerType::get(ctx, 8, pliron::builtin::types::Signedness::Unsigned).into();
+            let u8_ty = pliron::builtin::types::IntegerType::get(
+                ctx,
+                8,
+                pliron::builtin::types::Signedness::Unsigned,
+            )
+            .into();
             Ok(MirSliceType::get(ctx, u8_ty).into())
         }
         // Function pointer type (e.g. `fmt` fn ptrs in dead panic-formatting
         // branches): a thin opaque pointer.
         rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::FnPtr(_)) => {
             let target = dialect_mir::types::MirStructType::get_with_full_layout(
-                ctx, "FnPtrTarget".to_string(), vec![], vec![], vec![], vec![], 0,
+                ctx,
+                "FnPtrTarget".to_string(),
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                0,
+                0,
             )
             .into();
             Ok(dialect_mir::types::MirPtrType::get_generic(ctx, target, false).into())
@@ -907,7 +919,14 @@ pub fn translate_type(
         rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::FnDef(fn_def, _)) => {
             let name = format!("FnDef_{:?}", fn_def.def_id());
             Ok(dialect_mir::types::MirStructType::get_with_full_layout(
-                ctx, name, vec![], vec![], vec![], vec![], 0,
+                ctx,
+                name,
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                0,
+                0,
             )
             .into())
         }
