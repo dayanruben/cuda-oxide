@@ -1237,6 +1237,187 @@ pub fn translate_rvalue(
                         Ok((Some(op), result, prev_after_casts))
                     }
                 }
+                mir::AggregateKind::RawPtr(pointee_ty, mutability) => {
+                    // Raw pointer construction from parts: rustc lowers the
+                    // `aggregate_raw_ptr` intrinsic to this aggregate kind.
+                    // It is reached by re-slicing (`&bytes[2..]` goes through
+                    // `slice::index::get_offset_len_noubcheck`) and by
+                    // `ptr::slice_from_raw_parts` / `ptr::from_raw_parts`.
+                    // The two operands are (data_pointer, metadata).
+                    use rustc_public::mir::Mutability;
+                    use rustc_public::ty::{RigidTy, TyKind};
+
+                    if operands.len() != 2 {
+                        return input_err!(
+                            loc,
+                            TranslationErr::unsupported(format!(
+                                "RawPtr aggregate expected 2 operands (data, metadata), found {}",
+                                operands.len()
+                            ))
+                        );
+                    }
+
+                    let is_mutable = matches!(mutability, Mutability::Mut);
+
+                    match pointee_ty.kind() {
+                        TyKind::RigidTy(RigidTy::Slice(elem_ty)) => {
+                            // `*const [T]` / `*mut [T]`: the metadata operand is
+                            // the element count. `*const [T]` translates to
+                            // `MirSliceType` (same runtime layout as `&[T]`), so
+                            // build the fat pointer with `mir.construct_slice`.
+                            let element_type = types::translate_type(ctx, &elem_ty)?;
+
+                            let (data_val, prev_after_data) = translate_operand(
+                                ctx,
+                                body,
+                                &operands[0],
+                                value_map,
+                                block_ptr,
+                                prev_op,
+                                loc.clone(),
+                            )?;
+                            let (len_val, prev_after_len) = translate_operand(
+                                ctx,
+                                body,
+                                &operands[1],
+                                value_map,
+                                block_ptr,
+                                prev_after_data,
+                                loc.clone(),
+                            )?;
+
+                            // The fat pointer's data slot is a generic-addrspace
+                            // pointer. Values coming from shared memory carry
+                            // addrspace(3); normalize them like the struct/array
+                            // arms do.
+                            let expected_ptr_ty: Ptr<TypeObj> =
+                                dialect_mir::types::MirPtrType::get_generic(
+                                    ctx,
+                                    element_type,
+                                    is_mutable,
+                                )
+                                .into();
+                            let (data_val, current_prev_op) = cast_to_generic_addrspace_if_needed(
+                                ctx,
+                                data_val,
+                                expected_ptr_ty,
+                                block_ptr,
+                                prev_after_len,
+                                loc.clone(),
+                            );
+
+                            let slice_ty = dialect_mir::types::MirSliceType::get(ctx, element_type);
+
+                            use dialect_mir::ops::MirConstructSliceOp;
+                            let op = Operation::new(
+                                ctx,
+                                MirConstructSliceOp::get_concrete_op_info(),
+                                vec![slice_ty.into()],
+                                vec![data_val, len_val],
+                                vec![],
+                                0,
+                            );
+                            op.deref_mut(ctx).set_loc(loc);
+
+                            let result = op.deref(ctx).get_result(0);
+
+                            Ok((Some(op), result, current_prev_op))
+                        }
+                        TyKind::RigidTy(RigidTy::Str) => {
+                            // Blocked on `str` having a device-side type
+                            // translation (issue #76).
+                            input_err!(
+                                loc,
+                                TranslationErr::unsupported(
+                                    "RawPtr aggregate with `str` pointee not yet supported \
+                                     (no `str` type translation on device)"
+                                        .to_string()
+                                )
+                            )
+                        }
+                        TyKind::RigidTy(RigidTy::Dynamic(..)) => {
+                            // Trait objects need a vtable, which has no
+                            // device-side story.
+                            input_err!(
+                                loc,
+                                TranslationErr::unsupported(
+                                    "RawPtr aggregate with `dyn Trait` pointee not supported \
+                                     (no vtable support on device)"
+                                        .to_string()
+                                )
+                            )
+                        }
+                        _ => {
+                            // `Sized` pointee: the metadata operand is `()`, so
+                            // the aggregate is just the data pointer re-typed as
+                            // `*const P` / `*mut P`. Confirm the metadata really
+                            // is unit before dropping it; an unsized-tail struct
+                            // pointee would carry real metadata here.
+                            let metadata_ty = operands[1].ty(body.locals()).map_err(|e| {
+                                input_error!(
+                                    loc.clone(),
+                                    TranslationErr::unsupported(format!(
+                                        "Cannot get RawPtr aggregate metadata type: {e}"
+                                    ))
+                                )
+                            })?;
+                            let metadata_is_unit = matches!(
+                                metadata_ty.kind(),
+                                TyKind::RigidTy(RigidTy::Tuple(tys)) if tys.is_empty()
+                            );
+                            if !metadata_is_unit {
+                                return input_err!(
+                                    loc,
+                                    TranslationErr::unsupported(format!(
+                                        "RawPtr aggregate with non-unit metadata of type {:?} \
+                                         not yet supported",
+                                        metadata_ty
+                                    ))
+                                );
+                            }
+
+                            // Translate the target pointer type through the same
+                            // path as the destination local, so the two agree
+                            // (including SharedArray/Barrier special cases).
+                            let raw_ptr_ty_rust =
+                                rustc_public::ty::Ty::new_ptr(*pointee_ty, *mutability);
+                            let target_ty = types::translate_type(ctx, &raw_ptr_ty_rust)?;
+
+                            let (data_val, current_prev_op) = translate_operand(
+                                ctx,
+                                body,
+                                &operands[0],
+                                value_map,
+                                block_ptr,
+                                prev_op,
+                                loc.clone(),
+                            )?;
+
+                            if data_val.get_type(ctx) == target_ty {
+                                // Already the right pointer type: pass through.
+                                Ok((None, data_val, current_prev_op))
+                            } else {
+                                // Pointer re-typing, e.g. `*const ()` data
+                                // pointer becoming `*const P`.
+                                let cast_op = Operation::new(
+                                    ctx,
+                                    MirCastOp::get_concrete_op_info(),
+                                    vec![target_ty],
+                                    vec![data_val],
+                                    vec![],
+                                    0,
+                                );
+                                cast_op.deref_mut(ctx).set_loc(loc);
+                                MirCastOp::new(cast_op)
+                                    .set_attr_cast_kind(ctx, MirCastKindAttr::PtrToPtr);
+
+                                let result = cast_op.deref(ctx).get_result(0);
+
+                                Ok((Some(cast_op), result, current_prev_op))
+                            }
+                        }
+                    }
+                }
                 _ => {
                     input_err!(
                         loc,

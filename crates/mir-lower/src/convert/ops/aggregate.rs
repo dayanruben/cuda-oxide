@@ -16,6 +16,7 @@
 //! | `mir.insert_field`       | `llvm.insertvalue`                   | Set struct/tuple field |
 //! | `mir.construct_struct`   | `llvm.undef` + `llvm.insertvalue`    | Build struct           |
 //! | `mir.construct_tuple`    | `llvm.undef` + `llvm.insertvalue`    | Build tuple            |
+//! | `mir.construct_slice`    | `llvm.undef` + `llvm.insertvalue`    | Build slice fat ptr    |
 //! | `mir.construct_enum`     | `llvm.undef` + `llvm.insertvalue`    | Build enum             |
 //! | `mir.get_discriminant`   | `llvm.extractvalue`                  | Get enum tag           |
 //! | `mir.enum_payload`       | `llvm.extractvalue`                  | Get enum payload       |
@@ -388,6 +389,49 @@ pub(crate) fn convert_construct_tuple(
         Some(last_op) => rewriter.replace_operation(ctx, op, last_op),
         None => rewriter.replace_operation(ctx, op, undef_op.get_operation()),
     }
+
+    Ok(())
+}
+
+/// Convert `mir.construct_slice` to `llvm.undef` + two `llvm.insertvalue`s.
+///
+/// `MirSliceType` lowers to the `{ ptr, i64 }` fat-pointer struct, where
+/// field 0 is the data pointer and field 1 is the element count by
+/// construction (the same layout the entry prologue's `reconstruct_slice`
+/// and the Unsize cast path build).
+pub(crate) fn convert_construct_slice(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    _operands_info: &OperandsInfo,
+) -> Result<()> {
+    let (result_ty, data_val, len_val) = {
+        let mir_op = op.deref(ctx);
+        (
+            mir_op.get_result(0).get_type(ctx),
+            mir_op.get_operand(0),
+            mir_op.get_operand(1),
+        )
+    };
+
+    if !result_ty.deref(ctx).is::<MirSliceType>() {
+        return pliron::input_err_noloc!("MirConstructSliceOp result type must be MirSliceType");
+    }
+
+    let slice_struct_ty = make_slice_struct(ctx);
+
+    let undef_op = llvm::UndefOp::new(ctx, slice_struct_ty);
+    rewriter.insert_operation(ctx, undef_op.get_operation());
+    let undef_val = undef_op.get_operation().deref(ctx).get_result(0);
+
+    let insert_ptr = llvm::InsertValueOp::new(ctx, undef_val, data_val, vec![0]);
+    rewriter.insert_operation(ctx, insert_ptr.get_operation());
+    let with_ptr = insert_ptr.get_operation().deref(ctx).get_result(0);
+
+    let insert_len = llvm::InsertValueOp::new(ctx, with_ptr, len_val, vec![1]);
+    rewriter.insert_operation(ctx, insert_len.get_operation());
+
+    rewriter.replace_operation(ctx, op, insert_len.get_operation());
 
     Ok(())
 }
