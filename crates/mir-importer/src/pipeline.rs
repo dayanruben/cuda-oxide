@@ -1358,6 +1358,7 @@ mod tests {
             show_mir_dialect: false,
             show_llvm_dialect: false,
             emit_nvvm_ir: true,
+            debug_kind: DebugKind::Off,
         };
 
         let result = run_pipeline(&[], &[], &config).expect("pipeline run");
