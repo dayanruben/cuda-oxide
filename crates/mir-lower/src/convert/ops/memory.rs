@@ -128,11 +128,22 @@ fn copy_debug_local_variable(ctx: &mut Context, mir_op: Ptr<Operation>, llvm_op:
     }
 }
 
-/// Convert `mir.memcpy` to `llvm.memcpy.p0.p0.i64`.
+/// Convert `mir.memcpy` to the matching `llvm.memcpy.p<dst>.p<src>.i<bits>`.
 ///
 /// MIR's count is measured in pointee elements, while LLVM's memcpy intrinsic
 /// expects bytes. The pre-conversion destination pointer type still carries the
 /// MIR pointee, so use it to scale the count before emitting the call.
+///
+/// The intrinsic name is an overload: LLVM encodes each pointer's address
+/// space and the length width into it, and its verifier rejects a call whose
+/// argument types disagree with the name. Today every pointer reaching a
+/// `copy_nonoverlapping` is a Rust raw pointer, which cuda-oxide normalizes to
+/// the generic address space (an `addrspacecast` is inserted when the raw
+/// pointer is formed), so the operands are always `p0` and `i64`. We still
+/// derive the suffix from the real operand types rather than hardcoding
+/// `p0.p0.i64`: it matches how every other overloaded intrinsic is named here
+/// (`ctpop`, `fptosi.sat`, ...), and it keeps this lowering correct if raw
+/// pointers ever start carrying a non-generic address space.
 pub(crate) fn convert_memcpy(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
@@ -221,11 +232,31 @@ pub(crate) fn convert_memcpy(
             pliron::result::StringError("Memcpy operation has no parent block".to_string())
         )
     })?;
-    let intrinsic_name = "llvm_memcpy_p0_p0_i64";
-    helpers::ensure_intrinsic_declared(ctx, parent_block, intrinsic_name, func_ty)
+    // Derive the overload suffix from the real (already type-converted)
+    // operands so the name can never disagree with the argument types.
+    let dst_ty = dst.get_type(ctx);
+    let dst_as = dst_ty
+        .deref(ctx)
+        .downcast_ref::<llvm_export::types::PointerType>()
+        .map(|pt| pt.address_space())
+        .unwrap_or(0);
+    let src_ty = src.get_type(ctx);
+    let src_as = src_ty
+        .deref(ctx)
+        .downcast_ref::<llvm_export::types::PointerType>()
+        .map(|pt| pt.address_space())
+        .unwrap_or(0);
+    let len_bits = bytes
+        .get_type(ctx)
+        .deref(ctx)
+        .downcast_ref::<IntegerType>()
+        .map(|t| t.width())
+        .unwrap_or(64);
+    let intrinsic_name = format!("llvm_memcpy_p{dst_as}_p{src_as}_i{len_bits}");
+    helpers::ensure_intrinsic_declared(ctx, parent_block, &intrinsic_name, func_ty)
         .map_err(anyhow_to_pliron)?;
 
-    let callee: Identifier = intrinsic_name.try_into().map_err(|e| {
+    let callee: Identifier = intrinsic_name.as_str().try_into().map_err(|e| {
         pliron::create_error!(
             op.deref(ctx).loc(),
             pliron::result::ErrorKind::VerificationFailed,
