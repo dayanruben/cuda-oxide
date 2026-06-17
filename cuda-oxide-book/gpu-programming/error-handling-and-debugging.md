@@ -182,6 +182,47 @@ LLVM/DWARF says: "tid lives in this stack slot"
 cuda-gdb can try: print tid
 ```
 
+For local variables, the debugger also needs the current instruction to be
+inside the same lexical scope as the variable:
+
+```text
+function
+  └─ if-let block
+      └─ loop block
+          └─ current instruction
+```
+
+If you stop too early, such as at kernel launch or at the first helper call,
+the variable may honestly print as `<optimized out>` because it has not been
+loaded into a register yet. For variable checks, prefer a source line after the
+value is used:
+
+```gdb
+break src/main.rs:412
+run
+info args
+info locals
+```
+
+Seeing one variable as `<optimized out>` is not automatically a compiler bug;
+it can mean "this value has no live machine location at this exact PC." Debug
+info is a map, not a time machine.
+
+For inlined helper calls, cuda-oxide also keeps the original owner of each
+argument. That matters because two different functions can both have an
+argument numbered `1`:
+
+```text
+kernel(data) calls helper(self)
+
+data -> arg #1 in kernel's debug scope
+self -> arg #1 in helper's debug scope, with "inlined at" the kernel callsite
+```
+
+Without that scope split, LLVM treats the metadata as contradictory and drops
+it. Debug info is fussy like that; it wants the family tree, not just the
+surname.
+
 Use line tables first. They are enough for most "where did execution go?"
 questions, and they avoid the slower CUDA debug target mode. Use full debug
 when you specifically want `print idx`, `print ptr`, or similar local-variable
@@ -204,6 +245,48 @@ Useful aliases:
 | `line-tables`, `line`, `lines`, `1` | source line tables only |
 | `full`, `2` | line tables plus basic variable metadata |
 
+### Debug and optimization knobs
+
+There are two separate knobs:
+
+```text
+debug mode        -> what metadata cuda-oxide emits
+LLVM optimization -> whether exported LLVM IR goes through opt -O2
+```
+
+If you think of this as `debug = ...` and `optimize = 1/0`:
+
+| Setting | Meaning |
+|:--------|:--------|
+| `CUDA_OXIDE_DEBUG=off` | no device debug metadata |
+| `CUDA_OXIDE_DEBUG=line-tables` | source lines only |
+| `CUDA_OXIDE_DEBUG=full` | source lines plus supported locals and args |
+| default optimization | LLVM `opt -O2` runs before `llc` |
+| `CUDA_OXIDE_NO_OPT=1` | skip LLVM `opt -O2`; feed the unoptimized `.ll` to `llc` |
+
+Pliron `mem2reg` is different from LLVM `opt -O2`: it is part of the normal
+MIR pipeline and still runs before LLVM export. In full debug mode, when
+`mem2reg` removes a stack slot for a simple debugged local, cuda-oxide leaves a
+value record behind:
+
+```text
+before mem2reg:  dbg.declare(%x.slot, "x")
+after mem2reg:   dbg.value(%x.current_value, "x")
+```
+
+So:
+
+```text
+line-tables + optimize=1  -> fast source stepping, no locals
+line-tables + optimize=0  -> less optimized source stepping, no locals
+full        + optimize=1  -> locals when they survive/salvage through opt
+full        + optimize=0  -> simpler IR for cuda-gdb, usually easier locals
+```
+
+`full + optimize=0` is the most debugger-friendly shape. `full + optimize=1`
+is useful when you want to inspect locals without completely leaving the
+optimized pipeline, but some values may honestly show up as optimized out.
+
 ### What works today
 
 Line-table mode supports:
@@ -218,8 +301,8 @@ Full mode currently supports the first simple variable slice:
 - whole local variables and arguments that rustc exposes through
   `var_debug_info`
 - `bool`, integer, float, raw-pointer, and reference-shaped debug types
-- `llvm.dbg.declare` / LLVM-salvaged `dbg.value` metadata where LLVM can keep
-  the variable location alive
+- `llvm.dbg.declare` for remaining stack slots and `llvm.dbg.value` for simple
+  locals promoted by Pliron/LLVM
 
 Full mode does **not** yet describe rich Rust type trees such as structs,
 tuples, slices, arrays, closures, projections like `x.0`, or destructured

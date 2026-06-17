@@ -134,18 +134,28 @@ pub mod attributes {
 pub mod ops {
     pub use pliron_llvm::ops::*;
 
+    use std::path::PathBuf;
+
+    use combine::stream::position::SourcePosition;
+
     /// `ConstantOp` moved from the LLVM dialect to pliron core `builtin`.
     pub use pliron::builtin::ops::ConstantOp;
 
     use pliron::{
-        builtin::attributes::{BoolAttr, StringAttr},
+        builtin::{
+            attributes::{BoolAttr, StringAttr},
+            op_interfaces::{NOpdsInterface, NResultsInterface, OneOpdInterface},
+        },
+        common_traits::Verify,
         context::{Context, Ptr},
         identifier::Identifier,
         op::Op,
         operation::Operation,
+        result::Error,
         r#type::TypeObj,
         value::Value,
     };
+    use pliron_derive::pliron_op;
     use pliron_llvm::attributes::AlignmentAttr;
     pub use pliron_llvm::ops::{GlobalOp, InlineAsmOp};
 
@@ -204,11 +214,54 @@ pub mod ops {
     }
 
     /// Debug metadata attached to the alloca that stores a source local.
-    #[derive(Clone, Debug, Eq, PartialEq)]
+    #[derive(Clone, Debug, Eq, Hash, PartialEq)]
     pub struct DebugLocalVariableInfo {
         pub name: String,
         pub argument_index: Option<u16>,
         pub ty: DebugLocalTypeKind,
+    }
+
+    /// A source position small enough to carry through cuda-oxide attrs.
+    #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+    pub struct DebugSourcePosition {
+        pub file: PathBuf,
+        pub line: i32,
+        pub column: i32,
+    }
+
+    /// Extra scope information rustc records for MIR inlining.
+    #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+    pub struct DebugInlinedScope {
+        pub callee_name: String,
+        pub callsite: Option<DebugSourcePosition>,
+    }
+
+    /// One rustc MIR `SourceScope`, flattened into stable data.
+    #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+    pub struct DebugSourceScope {
+        pub id: u32,
+        pub parent: Option<u32>,
+        pub span: Option<DebugSourcePosition>,
+        pub inlined: Option<DebugInlinedScope>,
+    }
+
+    /// The original rustc MIR source scope for a statement or terminator span.
+    ///
+    /// stable MIR currently exposes the span, but not the `SourceScope`, on
+    /// statements and terminators. The rustc-codegen bridge records that
+    /// pairing before the stable-MIR conversion so instruction `!dbg` scopes
+    /// can match the lexical scopes used by local variables.
+    #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+    pub struct DebugSourceScopeLocation {
+        pub pos: DebugSourcePosition,
+        pub scope: u32,
+    }
+
+    /// The source-scope table for one function body.
+    #[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
+    pub struct DebugSourceScopeMap {
+        pub scopes: Vec<DebugSourceScope>,
+        pub locations: Vec<DebugSourceScopeLocation>,
     }
 
     const DEBUG_LOCAL_NAME_KEY: &str = "cuda_oxide_debug_local_name";
@@ -217,6 +270,12 @@ pub mod ops {
     const DEBUG_LOCAL_TYPE_NAME_KEY: &str = "cuda_oxide_debug_local_type_name";
     const DEBUG_LOCAL_TYPE_SIZE_KEY: &str = "cuda_oxide_debug_local_type_size_bits";
     const DEBUG_LOCAL_TYPE_ENCODING_KEY: &str = "cuda_oxide_debug_local_type_encoding";
+    const DEBUG_LOCAL_DECL_FILE_KEY: &str = "cuda_oxide_debug_local_decl_file";
+    const DEBUG_LOCAL_DECL_LINE_KEY: &str = "cuda_oxide_debug_local_decl_line";
+    const DEBUG_LOCAL_DECL_COLUMN_KEY: &str = "cuda_oxide_debug_local_decl_column";
+    const DEBUG_LOCAL_SCOPE_KEY: &str = "cuda_oxide_debug_local_scope";
+    const DEBUG_SOURCE_SCOPE_COUNT_KEY: &str = "cuda_oxide_debug_scope_count";
+    const DEBUG_SOURCE_SCOPE_LOCATION_COUNT_KEY: &str = "cuda_oxide_debug_scope_location_count";
 
     /// Stamp the ABI alignment (bytes) onto a memory op.
     pub fn set_op_alignment(ctx: &mut Context, op: Ptr<Operation>, align: u32) {
@@ -317,6 +376,276 @@ pub mod ops {
         })
     }
 
+    /// Attach the MIR source-scope id that owns this source local.
+    pub fn set_debug_local_source_scope(ctx: &mut Context, op: Ptr<Operation>, scope: u32) {
+        set_string_attr(ctx, op, DEBUG_LOCAL_SCOPE_KEY, scope.to_string());
+    }
+
+    /// Read the MIR source-scope id that owns this source local.
+    pub fn debug_local_source_scope(ctx: &Context, op: Ptr<Operation>) -> Option<u32> {
+        get_string_attr(ctx, op, DEBUG_LOCAL_SCOPE_KEY).and_then(|scope| scope.parse().ok())
+    }
+
+    /// Attach a function's MIR source-scope table.
+    pub fn set_debug_source_scope_map(
+        ctx: &mut Context,
+        op: Ptr<Operation>,
+        map: &DebugSourceScopeMap,
+    ) {
+        set_string_attr(
+            ctx,
+            op,
+            DEBUG_SOURCE_SCOPE_COUNT_KEY,
+            map.scopes.len().to_string(),
+        );
+        set_string_attr(
+            ctx,
+            op,
+            DEBUG_SOURCE_SCOPE_LOCATION_COUNT_KEY,
+            map.locations.len().to_string(),
+        );
+
+        for scope in &map.scopes {
+            let id = scope.id;
+            if let Some(parent) = scope.parent {
+                set_string_attr(ctx, op, &debug_scope_key(id, "parent"), parent.to_string());
+            }
+            if let Some(span) = &scope.span {
+                set_debug_position_attrs(ctx, op, id, "span", span);
+            }
+            if let Some(inlined) = &scope.inlined {
+                set_string_attr(
+                    ctx,
+                    op,
+                    &debug_scope_key(id, "callee"),
+                    inlined.callee_name.clone(),
+                );
+                if let Some(callsite) = &inlined.callsite {
+                    set_debug_position_attrs(ctx, op, id, "callsite", callsite);
+                }
+            }
+        }
+
+        for (idx, location) in map.locations.iter().enumerate() {
+            set_string_attr(
+                ctx,
+                op,
+                &debug_scope_location_key(idx, "scope"),
+                location.scope.to_string(),
+            );
+            set_debug_scope_location_position_attrs(ctx, op, idx, &location.pos);
+        }
+    }
+
+    /// Read a function's MIR source-scope table.
+    pub fn debug_source_scope_map(
+        ctx: &Context,
+        op: Ptr<Operation>,
+    ) -> Option<DebugSourceScopeMap> {
+        let count = get_string_attr(ctx, op, DEBUG_SOURCE_SCOPE_COUNT_KEY)?
+            .parse()
+            .ok()?;
+        let mut scopes = Vec::with_capacity(count);
+
+        for id in 0..count as u32 {
+            let parent = get_string_attr(ctx, op, &debug_scope_key(id, "parent"))
+                .and_then(|v| v.parse().ok());
+            let span = debug_position_attrs(ctx, op, id, "span");
+            let inlined = get_string_attr(ctx, op, &debug_scope_key(id, "callee")).map(|name| {
+                DebugInlinedScope {
+                    callee_name: name,
+                    callsite: debug_position_attrs(ctx, op, id, "callsite"),
+                }
+            });
+            scopes.push(DebugSourceScope {
+                id,
+                parent,
+                span,
+                inlined,
+            });
+        }
+
+        let location_count = get_string_attr(ctx, op, DEBUG_SOURCE_SCOPE_LOCATION_COUNT_KEY)
+            .and_then(|count| count.parse().ok())
+            .unwrap_or(0);
+        let mut locations = Vec::with_capacity(location_count);
+
+        for idx in 0..location_count {
+            let scope = get_string_attr(ctx, op, &debug_scope_location_key(idx, "scope"))
+                .and_then(|v| v.parse().ok())?;
+            let pos = debug_scope_location_position_attrs(ctx, op, idx)?;
+            locations.push(DebugSourceScopeLocation { pos, scope });
+        }
+
+        Some(DebugSourceScopeMap { scopes, locations })
+    }
+
+    /// Copy debug source-scope attrs from one operation to another.
+    pub fn copy_debug_source_scope_map(
+        ctx: &mut Context,
+        from: Ptr<Operation>,
+        to: Ptr<Operation>,
+    ) {
+        let Some(map) = debug_source_scope_map(ctx, from) else {
+            return;
+        };
+        set_debug_source_scope_map(ctx, to, &map);
+    }
+
+    /// Read an optional source declaration location for a debug local.
+    ///
+    /// Promoted `dbg.value` records have two useful locations: the operation
+    /// location where the value is current, and the source declaration location
+    /// for the `DILocalVariable`. This helper returns the latter when it was
+    /// preserved during MIR mem2reg promotion.
+    pub fn debug_local_declaration_location(
+        ctx: &Context,
+        op: Ptr<Operation>,
+    ) -> Option<(PathBuf, SourcePosition)> {
+        let file = PathBuf::from(get_string_attr(ctx, op, DEBUG_LOCAL_DECL_FILE_KEY)?);
+        let line = get_string_attr(ctx, op, DEBUG_LOCAL_DECL_LINE_KEY)?
+            .parse()
+            .ok()?;
+        let column = get_string_attr(ctx, op, DEBUG_LOCAL_DECL_COLUMN_KEY)?
+            .parse()
+            .ok()?;
+        if line <= 0 || column <= 0 {
+            return None;
+        }
+
+        Some((file, SourcePosition { line, column }))
+    }
+
+    /// Attach the source declaration location for a debug local.
+    pub fn set_debug_local_declaration_location(
+        ctx: &mut Context,
+        op: Ptr<Operation>,
+        file: PathBuf,
+        line: i32,
+        column: i32,
+    ) {
+        set_string_attr(
+            ctx,
+            op,
+            DEBUG_LOCAL_DECL_FILE_KEY,
+            file.to_string_lossy().into_owned(),
+        );
+        set_string_attr(ctx, op, DEBUG_LOCAL_DECL_LINE_KEY, line.to_string());
+        set_string_attr(ctx, op, DEBUG_LOCAL_DECL_COLUMN_KEY, column.to_string());
+    }
+
+    fn set_debug_position_attrs(
+        ctx: &mut Context,
+        op: Ptr<Operation>,
+        scope: u32,
+        prefix: &str,
+        pos: &DebugSourcePosition,
+    ) {
+        set_string_attr(
+            ctx,
+            op,
+            &debug_scope_key(scope, &format!("{prefix}_file")),
+            pos.file.to_string_lossy().into_owned(),
+        );
+        set_string_attr(
+            ctx,
+            op,
+            &debug_scope_key(scope, &format!("{prefix}_line")),
+            pos.line.to_string(),
+        );
+        set_string_attr(
+            ctx,
+            op,
+            &debug_scope_key(scope, &format!("{prefix}_column")),
+            pos.column.to_string(),
+        );
+    }
+
+    fn debug_position_attrs(
+        ctx: &Context,
+        op: Ptr<Operation>,
+        scope: u32,
+        prefix: &str,
+    ) -> Option<DebugSourcePosition> {
+        let file = PathBuf::from(get_string_attr(
+            ctx,
+            op,
+            &debug_scope_key(scope, &format!("{prefix}_file")),
+        )?);
+        let line = get_string_attr(ctx, op, &debug_scope_key(scope, &format!("{prefix}_line")))?
+            .parse()
+            .ok()?;
+        let column = get_string_attr(
+            ctx,
+            op,
+            &debug_scope_key(scope, &format!("{prefix}_column")),
+        )?
+        .parse()
+        .ok()?;
+        if line <= 0 || column <= 0 {
+            return None;
+        }
+
+        Some(DebugSourcePosition { file, line, column })
+    }
+
+    fn set_debug_scope_location_position_attrs(
+        ctx: &mut Context,
+        op: Ptr<Operation>,
+        idx: usize,
+        pos: &DebugSourcePosition,
+    ) {
+        set_string_attr(
+            ctx,
+            op,
+            &debug_scope_location_key(idx, "file"),
+            pos.file.to_string_lossy().into_owned(),
+        );
+        set_string_attr(
+            ctx,
+            op,
+            &debug_scope_location_key(idx, "line"),
+            pos.line.to_string(),
+        );
+        set_string_attr(
+            ctx,
+            op,
+            &debug_scope_location_key(idx, "column"),
+            pos.column.to_string(),
+        );
+    }
+
+    fn debug_scope_location_position_attrs(
+        ctx: &Context,
+        op: Ptr<Operation>,
+        idx: usize,
+    ) -> Option<DebugSourcePosition> {
+        let file = PathBuf::from(get_string_attr(
+            ctx,
+            op,
+            &debug_scope_location_key(idx, "file"),
+        )?);
+        let line = get_string_attr(ctx, op, &debug_scope_location_key(idx, "line"))?
+            .parse()
+            .ok()?;
+        let column = get_string_attr(ctx, op, &debug_scope_location_key(idx, "column"))?
+            .parse()
+            .ok()?;
+        if line <= 0 || column <= 0 {
+            return None;
+        }
+
+        Some(DebugSourcePosition { file, line, column })
+    }
+
+    fn debug_scope_key(scope: u32, field: &str) -> String {
+        format!("cuda_oxide_debug_scope_{scope}_{field}")
+    }
+
+    fn debug_scope_location_key(idx: usize, field: &str) -> String {
+        format!("cuda_oxide_debug_scope_location_{idx}_{field}")
+    }
+
     fn set_string_attr(ctx: &mut Context, op: Ptr<Operation>, key: &str, value: String) {
         let key = Identifier::try_new(key.to_string()).expect("valid identifier");
         op.deref_mut(ctx)
@@ -339,6 +668,42 @@ pub mod ops {
             "DW_ATE_signed" => Some("DW_ATE_signed"),
             "DW_ATE_unsigned" => Some("DW_ATE_unsigned"),
             _ => None,
+        }
+    }
+
+    /// LLVM debug-value marker used by the textual exporter.
+    ///
+    /// This is not a runtime instruction. It lowers to an `llvm.dbg.value`
+    /// intrinsic call that tells LLVM/DWARF where a source local lives after a
+    /// MIR stack slot has been promoted to an SSA value.
+    #[pliron_op(
+        name = "llvm.dbg_value",
+        format,
+        interfaces = [NOpdsInterface<1>, OneOpdInterface, NResultsInterface<0>]
+    )]
+    pub struct DebugValueOp;
+
+    impl DebugValueOp {
+        pub fn new(ctx: &mut Context, value: Value) -> Self {
+            let op = Operation::new(
+                ctx,
+                Self::get_concrete_op_info(),
+                vec![],
+                vec![value],
+                vec![],
+                0,
+            );
+            DebugValueOp { op }
+        }
+
+        pub fn value(&self, ctx: &Context) -> Value {
+            self.get_operation().deref(ctx).get_operand(0)
+        }
+    }
+
+    impl Verify for DebugValueOp {
+        fn verify(&self, _ctx: &Context) -> Result<(), Error> {
+            Ok(())
         }
     }
 

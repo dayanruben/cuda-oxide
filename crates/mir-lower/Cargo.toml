@@ -16,3 +16,4 @@ dialect-mir = { workspace = true }
 dialect-nvvm = { workspace = true }
 anyhow = { workspace = true }
 reserved-oxide-symbols = { workspace = true }
+combine = { workspace = true }

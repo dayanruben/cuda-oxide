@@ -105,6 +105,7 @@ pub fn translate_function(
         None,
         legaliser,
         DebugKind::Off,
+        None,
     )?;
 
     // Create a builtin.module operation using ModuleOp::new

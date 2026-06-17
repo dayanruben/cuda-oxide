@@ -50,6 +50,8 @@ pub struct CollectedFunction {
     pub is_kernel: bool,
     /// The name to export in PTX. For kernels, this is the user-visible name.
     pub export_name: String,
+    /// rustc MIR source-scope data used to build inlined debug scopes.
+    pub debug_source_scopes: Option<llvm_export::ops::DebugSourceScopeMap>,
 }
 
 /// An external device function declaration (for FFI with external LTOIR).
@@ -267,6 +269,7 @@ pub fn run_pipeline(
             Some(&func.export_name),
             &mut legaliser,
             config.debug_kind,
+            func.debug_source_scopes.as_ref(),
         )
         .map_err(|e| {
             // Use .disp(&ctx) for rich error formatting with location and backtrace
@@ -306,39 +309,31 @@ pub fn run_pipeline(
     }
 
     // Step 4.5: Run mem2reg (promote `mir.alloca` + `mir.load`/`mir.store`
-    // chains back to SSA values). Full debug deliberately skips this first:
-    // the initial variable-info implementation emits `dbg.declare` against
-    // local slots, so erasing those slots would make the debug locations false.
-    // A later optimized-debug stage can teach Pliron mem2reg to rewrite those
-    // locations into `dbg.value`, like LLVM's mem2reg does.
-    if config.debug_kind.variables_enabled() {
-        if config.verbose {
-            eprintln!("\n=== Skipping mem2reg (full device debug preserves local slots) ===");
-        }
-    } else {
-        if config.verbose {
-            eprintln!("\n=== Running mem2reg ===");
-        }
-        // pliron's pass infra now threads an AnalysisManager through mem2reg
-        // (caches dominator trees etc.); we run it standalone, so a fresh empty
-        // manager suffices. The returned IRStatus (Changed/Unchanged) is discarded.
-        let mut analyses = pliron::pass_manager::AnalysisManager::default();
-        pliron::opts::mem2reg::mem2reg(module_op_ptr, &mut ctx, &mut analyses).map_err(|e| {
-            PipelineError::Verification {
-                name: "mem2reg".to_string(),
-                message: e.disp(&ctx).to_string(),
-                operation: None,
-            }
-        })?;
-        if config.verbose {
-            eprintln!("mem2reg successful ✓");
-        }
-        if config.show_mir_dialect {
-            eprintln!("\n=== dialect-mir module (after mem2reg) ===");
-            eprintln!("{}", module_op_ptr.deref(&ctx).disp(&ctx));
-        }
-        verify_operation(&ctx, module_op_ptr, "module post-mem2reg")?;
+    // chains back to SSA values). In full-debug mode, tagged local slots leave
+    // behind `mir.dbg_value` records as they are promoted, so variable
+    // locations move from "this stack slot" to "this SSA value here".
+    if config.verbose {
+        eprintln!("\n=== Running mem2reg ===");
     }
+    // pliron's pass infra now threads an AnalysisManager through mem2reg
+    // (caches dominator trees etc.); we run it standalone, so a fresh empty
+    // manager suffices. The returned IRStatus (Changed/Unchanged) is discarded.
+    let mut analyses = pliron::pass_manager::AnalysisManager::default();
+    pliron::opts::mem2reg::mem2reg(module_op_ptr, &mut ctx, &mut analyses).map_err(|e| {
+        PipelineError::Verification {
+            name: "mem2reg".to_string(),
+            message: e.disp(&ctx).to_string(),
+            operation: None,
+        }
+    })?;
+    if config.verbose {
+        eprintln!("mem2reg successful ✓");
+    }
+    if config.show_mir_dialect {
+        eprintln!("\n=== dialect-mir module (after mem2reg) ===");
+        eprintln!("{}", module_op_ptr.deref(&ctx).disp(&ctx));
+    }
+    verify_operation(&ctx, module_op_ptr, "module post-mem2reg")?;
 
     // Step 5: Lower dialect-mir → LLVM dialect.
     if config.verbose {
@@ -1063,8 +1058,9 @@ fn generate_ptx(
     // determined by what the source actually needs, not what opt elides.
     //
     // Full debug still reaches this point as real LLVM debug intrinsics.
-    // LLVM's optimizer knows how to salvage many `dbg.declare` slot locations
-    // into optimized `dbg.value`/debug-record locations, unlike Pliron mem2reg.
+    // Pliron mem2reg has already salvaged simple promoted locals into
+    // `mir.dbg_value`; LLVM's optimizer can continue salvaging many
+    // `dbg.declare`/`dbg.value` locations into optimized debug records.
     let optimized = optimize_ll(ll_path, &toolchain, verbose);
     let llc_input: &Path = optimized.as_deref().unwrap_or(ll_path);
 

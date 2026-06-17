@@ -27,7 +27,7 @@ use crate::translator::values::{self, SlotAddrSpaceMap, ValueMap};
 use dialect_mir::ops::MirFuncOp;
 use dialect_mir::types::address_space;
 use llvm_export::export::DebugKind;
-use llvm_export::ops::{DebugLocalTypeKind, DebugLocalVariableInfo};
+use llvm_export::ops::{DebugLocalTypeKind, DebugLocalVariableInfo, DebugSourceScopeMap};
 use pliron::basic_block::BasicBlock;
 use pliron::builtin::op_interfaces::SymbolOpInterface;
 use pliron::context::{Context, Ptr};
@@ -211,6 +211,7 @@ fn compute_reachable_blocks(body: &mir::Body) -> std::collections::BTreeSet<usiz
 struct LocalDebugInfo {
     variable: DebugLocalVariableInfo,
     loc: pliron::location::Location,
+    source_scope: u32,
 }
 
 /// Build the first full-debug variable map.
@@ -262,6 +263,7 @@ fn collect_debug_locals(
                 ty,
             },
             loc: span_to_location(ctx, info.source_info.span),
+            source_scope: info.source_info.scope,
         });
     }
 
@@ -407,6 +409,7 @@ fn emit_entry_allocas(
     num_args: usize,
     value_map: &mut ValueMap,
     debug_kind: DebugKind,
+    debug_source_scopes: Option<&DebugSourceScopeMap>,
 ) -> Option<Ptr<Operation>> {
     let mut prev_op: Option<Ptr<Operation>> = None;
     let debug_locals = if debug_kind.variables_enabled() {
@@ -443,6 +446,11 @@ fn emit_entry_allocas(
         let (op, slot) = ValueMap::emit_alloca(ctx, mir_ty, entry_block, prev_op);
         if let Some(info) = debug_locals.get(&local) {
             llvm_export::ops::set_debug_local_variable(ctx, op, info.variable.clone());
+            if debug_source_scopes
+                .is_some_and(|map| map.scopes.iter().any(|scope| scope.id == info.source_scope))
+            {
+                llvm_export::ops::set_debug_local_source_scope(ctx, op, info.source_scope);
+            }
             op.deref_mut(ctx).set_loc(info.loc.clone());
         }
         prev_op = Some(op);
@@ -488,6 +496,7 @@ pub fn translate_body(
     override_name: Option<&str>,
     legaliser: &mut Legaliser,
     debug_kind: DebugKind,
+    debug_source_scopes: Option<&DebugSourceScopeMap>,
 ) -> TranslationResult<Ptr<Operation>> {
     // Create a value map to track MIR locals -> pliron IR values
     let num_locals = body.locals().len();
@@ -710,6 +719,12 @@ pub fn translate_body(
         }
     }
 
+    if let Some(scope_map) = debug_source_scopes
+        && debug_kind.variables_enabled()
+    {
+        llvm_export::ops::set_debug_source_scope_map(ctx, op_ptr, scope_map);
+    }
+
     // Get the function body region (region 0)
     let region_ptr = op_ptr.deref(ctx).get_region(0);
 
@@ -756,6 +771,7 @@ pub fn translate_body(
         num_args,
         &mut value_map,
         debug_kind,
+        debug_source_scopes,
     );
 
     // -------------------------------------------------------------------------

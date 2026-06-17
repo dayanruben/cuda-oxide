@@ -93,7 +93,13 @@
 //! and is negligible compared to actual compilation time.
 
 use crate::collector::{CollectedFunction, DeviceExternDecl};
+use llvm_export::ops::{
+    DebugInlinedScope, DebugSourcePosition, DebugSourceScope, DebugSourceScopeLocation,
+    DebugSourceScopeMap,
+};
+use rustc_middle::ty::{EarlyBinder, TypingEnv};
 use rustc_middle::ty::{Ty, TyCtxt, TyKind};
+use rustc_span::{Span, hygiene};
 use rustc_session::config::DebugInfo;
 use std::path::PathBuf;
 
@@ -222,6 +228,88 @@ impl Default for DeviceCodegenConfig {
     }
 }
 
+fn build_debug_source_scope_map<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    func: &CollectedFunction<'tcx>,
+) -> DebugSourceScopeMap {
+    let mir = tcx.instance_mir(func.instance.def);
+    let scopes = mir
+        .source_scopes
+        .iter_enumerated()
+        .map(|(scope, data)| {
+            let inlined = data.inlined.map(|(callee, callsite)| {
+                let callee = tcx.instantiate_and_normalize_erasing_regions(
+                    func.instance.args,
+                    TypingEnv::fully_monomorphized(),
+                    EarlyBinder::bind(callee),
+                );
+                let callsite = hygiene::walk_chain_collapsed(callsite, mir.span);
+                DebugInlinedScope {
+                    callee_name: rustc_middle::ty::print::with_no_trimmed_paths!(callee
+                        .to_string()),
+                    callsite: debug_position_from_span(tcx, callsite),
+                }
+            });
+
+            DebugSourceScope {
+                id: scope.as_u32(),
+                parent: data.parent_scope.map(|parent| parent.as_u32()),
+                span: debug_position_from_span(tcx, data.span.source_callsite()),
+                inlined,
+            }
+        })
+        .collect();
+
+    let mut locations = Vec::new();
+    for block in mir.basic_blocks.iter() {
+        for stmt in &block.statements {
+            if let Some(pos) = debug_position_from_span(tcx, stmt.source_info.span) {
+                locations.push(DebugSourceScopeLocation {
+                    pos,
+                    scope: stmt.source_info.scope.as_u32(),
+                });
+            }
+        }
+
+        let terminator = block.terminator();
+        if let Some(pos) = debug_position_from_span(tcx, terminator.source_info.span) {
+            locations.push(DebugSourceScopeLocation {
+                pos,
+                scope: terminator.source_info.scope.as_u32(),
+            });
+        }
+    }
+    locations.sort_by(|lhs, rhs| {
+        (&lhs.pos.file, lhs.pos.line, lhs.pos.column, lhs.scope).cmp(&(
+            &rhs.pos.file,
+            rhs.pos.line,
+            rhs.pos.column,
+            rhs.scope,
+        ))
+    });
+    locations.dedup();
+
+    DebugSourceScopeMap { scopes, locations }
+}
+
+fn debug_position_from_span(tcx: TyCtxt<'_>, span: Span) -> Option<DebugSourcePosition> {
+    let (file, line, column, _, _) = tcx.sess.source_map().span_to_location_info(span);
+    let file = file?;
+    if line == 0 || column == 0 {
+        return None;
+    }
+
+    Some(DebugSourcePosition {
+        file: file
+            .name
+            .prefer_local_unconditionally()
+            .to_string()
+            .into(),
+        line: line as i32,
+        column: column as i32,
+    })
+}
+
 /// Errors that can occur during device code generation.
 #[derive(Debug)]
 pub enum DeviceCodegenError {
@@ -335,6 +423,10 @@ pub fn generate_device_code<'tcx>(
         .iter()
         .map(|f| (f.export_name.clone(), f.is_kernel))
         .collect();
+    let debug_scope_maps: Vec<_> = functions
+        .iter()
+        .map(|f| build_debug_source_scope_map(tcx, f))
+        .collect();
 
     // Convert device externs to mir-importer format
     // We extract signature info from rustc here since we have access to TyCtxt
@@ -434,7 +526,8 @@ pub fn generate_device_code<'tcx>(
         let stable_functions: Vec<mir_importer::CollectedFunction> = functions
             .iter()
             .zip(export_names.iter())
-            .map(|(func, (export_name, is_kernel))| {
+            .zip(debug_scope_maps.iter())
+            .map(|((func, (export_name, is_kernel)), debug_source_scopes)| {
                 // Use rustc_internal::stable() to convert the Instance.
                 // This is the key bridge between rustc_middle and rustc_public types.
                 let stable_instance = rustc_internal::stable(func.instance);
@@ -443,6 +536,7 @@ pub fn generate_device_code<'tcx>(
                     instance: stable_instance,
                     is_kernel: *is_kernel,
                     export_name: export_name.clone(),
+                    debug_source_scopes: Some(debug_source_scopes.clone()),
                 }
             })
             .collect();
