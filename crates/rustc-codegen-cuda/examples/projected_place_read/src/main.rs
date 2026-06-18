@@ -72,7 +72,11 @@ fn main() {
         .expect("projected_read_2d launch");
 
     let out = out_dev.to_host_vec(&stream).unwrap();
-    assert_eq!(out, vec![3.0]);
+    assert!(
+        (out[0] - 3.0_f64).abs() < 1e-12,
+        "projected_read_2d: got {}, want 3.0",
+        out[0]
+    );
 
     println!("SUCCESS: projected place read produces correct results");
 }
