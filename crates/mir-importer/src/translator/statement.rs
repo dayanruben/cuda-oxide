@@ -73,19 +73,12 @@ pub fn translate_statement(
             // Fast path: array aggregate assigned to an addressable local.
             // Write each element directly into the alloca storage instead of
             // building an SSA aggregate (insertvalue chain) and then storing it.
-            if let mir::Rvalue::Aggregate(mir::AggregateKind::Array(_), operands) = rvalue {
-                if value_map.get_slot(place.local).is_some() {
-                    return translate_array_agg_into_alloca(
-                        ctx,
-                        body,
-                        place,
-                        operands,
-                        value_map,
-                        block_ptr,
-                        prev_op,
-                        loc,
-                    );
-                }
+            if let mir::Rvalue::Aggregate(mir::AggregateKind::Array(_), operands) = rvalue
+                && value_map.get_slot(place.local).is_some()
+            {
+                return translate_array_agg_into_alloca(
+                    ctx, body, place, operands, value_map, block_ptr, prev_op, loc,
+                );
             }
 
             // Translate the Rvalue to get the value being assigned
