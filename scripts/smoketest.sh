@@ -40,7 +40,7 @@ set -uo pipefail
 
 # ---- Example categorization ---------------------------------------------
 
-TCGEN05_EXAMPLES=(gemm_sol tcgen05 tcgen05_matmul)
+TCGEN05_EXAMPLES=(gemm_sol gemm_sol_final tcgen05 tcgen05_matmul)
 WGMMA_EXAMPLES=(wgmma)
 LTOIR_EXAMPLES=(addressof_sharedarray cpp_consumes_rust_device device_ffi_test legacy_nvvm_pointer_shapes manual_launch_libdevice mathdx_ffi_test primitive_stress)
 AUTO_NVVM_EXAMPLES=(libdevice_math)

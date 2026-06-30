@@ -25,7 +25,7 @@ prints a BF16-input/BF16-output section for context.
 
 Historical throughput from another GPU, driver, or toolkit is not a valid
 baseline. Build and run the benchmark on the same host as every kernel trial;
-the accepted iteration-8 measurements are recorded in `../README.md`.
+the accepted final measurements are recorded in `../README.md`.
 
 ## Requirements
 

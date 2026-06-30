@@ -72,4 +72,4 @@ set -x
 { set +x; } 2>/dev/null
 
 echo "✓ Built: $here/cublaslt_bench"
-echo "  gemm_sol's main.rs will pick this up automatically on the next run."
+echo "  gemm_sol_final's main.rs will pick this up automatically on the next run."

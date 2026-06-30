@@ -10,12 +10,12 @@
     clippy::too_many_arguments
 )]
 
-//! Frozen cuda-oxide example of gemm-sol-autocuda iteration 8.
+//! Canonical cuda-oxide Blackwell GEMM speed-of-light example.
 //!
-//! The example contains one device kernel:
-//! `gemm_sol_clc_multicast_4_stage_pipeline`. It uses CLC work scheduling,
-//! `cta_group::2` UMMA, a four-stage shared-memory pipeline, compiler-directed
-//! loop unrolling, and L2-aware output-tile ordering.
+//! Two resource-specialized entry points share the same CLC + `cta_group::2`
+//! design: M256xN256 for 4096/8192 and M512xN256 for 16384. Both use a
+//! four-stage shared-memory pipeline, compiler-directed K-loop unrolling,
+//! L2-aware output-tile ordering, and vectorized 64-bit epilogue stores.
 //!
 //! Data layout:
 //! - A: M×K f16, row-major (K contiguous)
@@ -249,13 +249,26 @@ fn build_smem_descriptor(
 // here so #[cuda_module] sees an inline module with a brace body.
 include!("kernels.rs");
 
+type GemmKernelLauncher = unsafe fn(
+    &kernels::LoadedModule,
+    &CudaStream,
+    LaunchConfig,
+    *const TmaDescriptor,
+    *const TmaDescriptor,
+    &mut DeviceBuffer<u32>,
+    i32,
+    i32,
+    u32,
+    u32,
+) -> Result<(), cuda_core::DriverError>;
+
 // =============================================================================
 // HOST CODE
 // =============================================================================
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("═══════════════════════════════════════════════════════");
-    println!("  GEMM SoL — gemm_sol_clc_multicast_4_stage_pipeline");
+    println!("  GEMM SoL — gemm_sol_final (size-specialized)");
     println!("═══════════════════════════════════════════════════════\n");
 
     let mode = std::env::var("GEMM_SOL_MODE").unwrap_or_else(|_| "both".to_string());
@@ -281,8 +294,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return verify_ptx_only();
     }
 
-    let ptx_path =
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("gemm_sol_iteration_8.ptx");
+    let ptx_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("gemm_sol_final.ptx");
     println!("Loading PTX: {}", ptx_path.display());
     let ptx_str = ptx_path.to_str().ok_or("PTX path must be valid UTF-8")?;
     let module = match ctx.load_module_from_file(ptx_str) {
@@ -300,8 +312,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("PTX loaded\n");
 
     if do_validate {
-        println!("── Full-output correctness test ─────────────────────\n");
-        run_correctness_test_clc_multicast_4_stage_pipeline(&stream, &module, 4096, 4096, 4096)?;
+        println!("── Full-output correctness tests ────────────────────\n");
+        run_correctness_test_clc_multicast_4_stage_pipeline(
+            &stream,
+            &module,
+            kernels::LoadedModule::gemm_sol_clc_multicast_4_stage_pipeline,
+            "gemm_sol_clc_multicast_4_stage_pipeline",
+            "M256xN256",
+            4096,
+            4096,
+            4096,
+        )?;
+        run_correctness_test_clc_multicast_4_stage_pipeline(
+            &stream,
+            &module,
+            kernels::LoadedModule::gemm_sol_clc_multicast_4_stage_pipeline_large,
+            "gemm_sol_clc_multicast_4_stage_pipeline_large",
+            "M512xN256",
+            4096,
+            4096,
+            4096,
+        )?;
     }
 
     if do_bench {
@@ -371,6 +402,9 @@ fn validation_b_value(col: usize, kk: usize) -> f32 {
 fn run_correctness_test_clc_multicast_4_stage_pipeline(
     stream: &Arc<CudaStream>,
     module: &kernels::LoadedModule,
+    launch_kernel: GemmKernelLauncher,
+    kernel_name: &str,
+    output_tile: &str,
     m: usize,
     n: usize,
     k: usize,
@@ -381,6 +415,7 @@ fn run_correctness_test_clc_multicast_4_stage_pipeline(
         "the bit-exact Walsh validator is defined for the fixed 4096³ contract"
     );
 
+    println!("Entry: {kernel_name} ({output_tile})");
     println!("Matrix: {}x{}x{} (f16 -> bf16)", m, n, k);
     println!("CLC + cta_group::2 + 4-stage SMEM pipeline.");
     println!("Warps: 4=TMA, 5=MMA (leader only), 0-3=epilogue (both CTAs).");
@@ -449,9 +484,10 @@ fn run_correctness_test_clc_multicast_4_stage_pipeline(
         "Grid: {} CTAs (1D, CLC-managed), cluster: 2x1x1 (cg2), block: 192 threads (6 warps)",
         total_tiles * 2
     );
+    let swizzle_g = if tiles_m <= 16 { 2 } else { 8 };
     println!(
-        "Total tiles: {} ({}x{}), SWIZZLE_G=8 L2 cache-blocked ordering",
-        total_tiles, tiles_m, tiles_n
+        "Host work IDs: {} ({}x{}), logical L2 band G={}",
+        total_tiles, tiles_m, tiles_n, swizzle_g
     );
     println!("K-loop: {} outer iters (BK=64, 4 MMAs each)", k / 64);
 
@@ -465,11 +501,12 @@ fn run_correctness_test_clc_multicast_4_stage_pipeline(
     let n_arg = n as i32;
     let k_arg = k as i32;
 
-    println!("\nLaunching gemm_sol_clc_multicast_4_stage_pipeline (cg2)...");
+    println!("\nLaunching {kernel_name} (cg2)...");
 
     unsafe {
-        module.gemm_sol_clc_multicast_4_stage_pipeline(
-            (stream).as_ref(),
+        launch_kernel(
+            module,
+            stream.as_ref(),
             cfg,
             a_tma_ptr,
             b_tma_ptr,
@@ -541,13 +578,13 @@ fn run_correctness_test_clc_multicast_4_stage_pipeline(
     println!("\n═══════════════════════════════════════════════════════");
     if all_ok {
         println!(
-            "PASSED: gemm_sol_clc_multicast_4_stage_pipeline {}x{}x{} (full {}-element check)",
-            m, n, k, total
+            "PASSED: {} {}x{}x{} (full {}-element check)",
+            kernel_name, m, n, k, total
         );
     } else {
         println!(
-            "FAILED: gemm_sol_clc_multicast_4_stage_pipeline {}x{}x{}: {} / {} elements wrong",
-            m, n, k, mismatches, total
+            "FAILED: {} {}x{}x{}: {} / {} elements wrong",
+            kernel_name, m, n, k, mismatches, total
         );
         return Err(format!(
             "Correctness check failed: {} / {} elements wrong",
@@ -610,10 +647,26 @@ fn run_benchmark_clc_multicast_4_stage_pipeline(
     let output_u32_count = m * n / 2;
     let mut dev_output = DeviceBuffer::<u32>::zeroed(stream, output_u32_count)?;
 
+    let (launch_kernel, kernel_name, output_tile): (GemmKernelLauncher, &str, &str) =
+        if tiles_m >= 64 {
+            (
+                kernels::LoadedModule::gemm_sol_clc_multicast_4_stage_pipeline_large,
+                "gemm_sol_clc_multicast_4_stage_pipeline_large",
+                "M512xN256",
+            )
+        } else {
+            (
+                kernels::LoadedModule::gemm_sol_clc_multicast_4_stage_pipeline,
+                "gemm_sol_clc_multicast_4_stage_pipeline",
+                "M256xN256",
+            )
+        };
+
     for _ in 0..WARMUP {
         unsafe {
-            module.gemm_sol_clc_multicast_4_stage_pipeline(
-                (stream).as_ref(),
+            launch_kernel(
+                module,
+                stream.as_ref(),
                 cfg,
                 a_tma_ptr,
                 b_tma_ptr,
@@ -632,8 +685,9 @@ fn run_benchmark_clc_multicast_4_stage_pipeline(
 
     for _ in 0..ITERS {
         unsafe {
-            module.gemm_sol_clc_multicast_4_stage_pipeline(
-                (stream).as_ref(),
+            launch_kernel(
+                module,
+                stream.as_ref(),
                 cfg,
                 a_tma_ptr,
                 b_tma_ptr,
@@ -659,8 +713,8 @@ fn run_benchmark_clc_multicast_4_stage_pipeline(
 
     println!("═══════════════════════════════════════════════════════");
     println!(
-        "  BENCHMARK: gemm_sol_clc_multicast_4_stage_pipeline (cg2) {}x{}x{} f16 -> bf16",
-        m, n, k
+        "  BENCHMARK: {} ({}, cg2) {}x{}x{} f16 -> bf16",
+        kernel_name, output_tile, m, n, k
     );
     println!("═══════════════════════════════════════════════════════");
     println!(
@@ -681,8 +735,7 @@ fn run_benchmark_clc_multicast_4_stage_pipeline(
 }
 
 fn verify_ptx_only() -> Result<(), Box<dyn std::error::Error>> {
-    let ptx_path =
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("gemm_sol_iteration_8.ptx");
+    let ptx_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("gemm_sol_final.ptx");
 
     if !ptx_path.exists() {
         return Err("PTX file not found".into());

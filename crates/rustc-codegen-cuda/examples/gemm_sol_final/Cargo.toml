@@ -1,8 +1,8 @@
-# Frozen standalone example of gemm-sol-autocuda iteration 8. The package name
-# determines the emitted PTX filename loaded by src/main.rs.
+# Canonical standalone cuda-oxide Blackwell GEMM SoL example. The package
+# name determines the emitted PTX filename loaded by src/main.rs.
 
 [package]
-name = "gemm_sol_iteration_8"
+name = "gemm_sol_final"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
