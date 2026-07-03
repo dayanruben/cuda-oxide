@@ -18,10 +18,10 @@
 //! 2. Device function calling another device function (transitive collection)
 //! 3. Generic logic via concrete wrappers, including multiple monomorphizations
 //! 4. Device function using GPU intrinsics (thread indexing)
-//! 5. F16 and TF32 warp-MMA lowering through the complete PTX pipeline
+//! 5. F16, TF32, and INT8 warp-MMA lowering through the complete PTX pipeline
 
 use cuda_device::thread;
-use cuda_device::wmma::{mma_m16n8k8_f32_tf32, mma_m16n8k16_f32_f16};
+use cuda_device::wmma::{mma_m16n8k8_f32_tf32, mma_m16n8k16_f32_f16, mma_m16n8k32_s32_s8};
 use cuda_device::{device, ptx_asm};
 
 // =============================================================================
@@ -143,7 +143,7 @@ pub fn get_global_thread_id() -> usize {
 }
 
 // =============================================================================
-// TEST 5: F16 and TF32 warp-MMA stubs through the complete compiler pipeline
+// TEST 5: Warp-MMA stubs through the complete compiler pipeline
 //
 // The host never calls these functions. Compiling them proves that the public
 // cuda-device stubs and the required f32-to-TF32 conversion reach exact PTX.
@@ -200,6 +200,17 @@ pub unsafe fn mma_m16n8k8_f32_tf32_from_f32_stub(
     }
 }
 
+/// Emits one register-only signed INT8 tensor-core MMA instruction.
+///
+/// # Safety
+///
+/// The caller must satisfy [`mma_m16n8k32_s32_s8`]'s warp participation and
+/// per-lane fragment-layout contract.
+#[device]
+pub unsafe fn int8_mma_registers(c: [i32; 4], a: [u32; 4], b: [u32; 2]) -> [i32; 4] {
+    unsafe { mma_m16n8k32_s32_s8(c, a, b) }
+}
+
 // =============================================================================
 // HOST CODE - Verifies PTX was generated correctly
 // =============================================================================
@@ -241,6 +252,7 @@ fn main() {
             "mma_m16n8k8_f32_tf32_from_f32_stub",
             "Test 5: f32-to-TF32 conversion path",
         ),
+        ("int8_mma_registers", "Test 5: signed INT8 warp-MMA stub"),
     ];
 
     let mut passed = 0;
@@ -304,9 +316,49 @@ fn main() {
         failed += 1;
     }
 
+    let int8_mma = "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32";
+    if ptx_content.contains(int8_mma) {
+        println!("  PASS  INT8 MMA lowered to the exact PTX instruction");
+        passed += 1;
+    } else {
+        println!("  FAIL  Missing exact INT8 MMA PTX instruction");
+        failed += 1;
+    }
+
+    let ptx_version = ptx_content
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(".version "))
+        .and_then(|version| version.split_once('.'))
+        .and_then(|(major, minor)| Some((major.parse::<u32>().ok()?, minor.parse::<u32>().ok()?)));
+    if ptx_version.is_some_and(|version| version >= (7, 0)) {
+        println!("  PASS  INT8 MMA selected PTX 7.0 or newer");
+        passed += 1;
+    } else {
+        println!("  FAIL  Generated PTX did not meet the PTX 7.0 floor");
+        failed += 1;
+    }
+
+    let sm_target = ptx_content
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(".target sm_"))
+        .map(|target| {
+            target
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+        })
+        .and_then(|target| target.parse::<u32>().ok());
+    if sm_target.is_some_and(|target| target >= 80) {
+        println!("  PASS  INT8 MMA selected sm_80 or newer");
+        passed += 1;
+    } else {
+        println!("  FAIL  Generated PTX did not meet the sm_80 floor");
+        failed += 1;
+    }
+
     println!();
     if failed == 0 {
-        let total = tests.len() + 5; // +2 MMA, +1 TF32 conversion, +1 lerp, +1 no .entry
+        let total = tests.len() + 8;
         println!(
             "SUCCESS: {}/{} tests passed — all device functions compiled to PTX!",
             passed, total
