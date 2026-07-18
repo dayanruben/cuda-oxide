@@ -21,11 +21,17 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProbeInvocation {
     Evidence {
-        intrinsic_id: String,
+        selection: EvidenceProbeSelection,
         llc: Option<PathBuf>,
         skip_terminal: bool,
     },
     Candidate(probe::CandidateProbeOptions),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EvidenceProbeSelection {
+    Intrinsic(String),
+    All,
 }
 
 fn main() {
@@ -67,10 +73,15 @@ fn try_main() -> Result<()> {
         }
         "probe" => match parse_probe_invocation(arguments)? {
             ProbeInvocation::Evidence {
-                intrinsic_id,
+                selection,
                 llc,
                 skip_terminal,
-            } => probe::run(&repo_root, &intrinsic_id, llc, skip_terminal),
+            } => match selection {
+                EvidenceProbeSelection::Intrinsic(intrinsic_id) => {
+                    probe::run(&repo_root, &intrinsic_id, llc, skip_terminal)
+                }
+                EvidenceProbeSelection::All => probe::run_all(&repo_root, llc, skip_terminal),
+            },
             ProbeInvocation::Candidate(options) => probe::run_candidate(&repo_root, options),
         },
         "check-abi-history" => {
@@ -92,13 +103,21 @@ fn try_main() -> Result<()> {
 
 fn parse_probe_invocation(mut arguments: Vec<String>) -> Result<ProbeInvocation> {
     if !take_flag(&mut arguments, "--candidate") {
-        let intrinsic_id =
-            take_option(&mut arguments, "--intrinsic")?.unwrap_or_else(|| "thread_idx_x".into());
+        let all = take_flag(&mut arguments, "--all");
+        let intrinsic_id = take_option(&mut arguments, "--intrinsic")?;
+        if all && intrinsic_id.is_some() {
+            bail!("probe --all and --intrinsic cannot be used together");
+        }
+        let selection = if all {
+            EvidenceProbeSelection::All
+        } else {
+            EvidenceProbeSelection::Intrinsic(intrinsic_id.unwrap_or_else(|| "thread_idx_x".into()))
+        };
         let llc = take_option(&mut arguments, "--llc")?.map(PathBuf::from);
         let skip_terminal = take_flag(&mut arguments, "--skip-terminal");
         reject_extra(arguments)?;
         return Ok(ProbeInvocation::Evidence {
-            intrinsic_id,
+            selection,
             llc,
             skip_terminal,
         });
@@ -165,7 +184,7 @@ fn print_usage() {
          cuda-intrinsics-gen generate [--repo-root DIR]\n  \
          cuda-intrinsics-gen check [--repo-root DIR]\n  \
          cuda-intrinsics-gen check-abi-history --base-ref REF [--repo-root DIR]\n  \
-         cuda-intrinsics-gen probe [--intrinsic ID] [--llc FILE] [--skip-terminal] [--repo-root DIR]\n  \
+         cuda-intrinsics-gen probe [--all | --intrinsic ID] [--llc FILE] [--skip-terminal] [--repo-root DIR]\n  \
          cuda-intrinsics-gen probe --candidate --intrinsic ID --llc FILE --gpu-target TARGET --ptx-feature FEATURE (--ptxas FILE | --skip-terminal) [--repo-root DIR]"
     );
 }
@@ -176,6 +195,60 @@ mod tests {
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).into()).collect()
+    }
+
+    #[test]
+    fn normal_probe_defaults_to_thread_idx_x() {
+        let ProbeInvocation::Evidence {
+            selection: EvidenceProbeSelection::Intrinsic(intrinsic_id),
+            llc: None,
+            skip_terminal: false,
+        } = parse_probe_invocation(Vec::new()).unwrap()
+        else {
+            panic!("expected one selected-evidence probe")
+        };
+        assert_eq!(intrinsic_id, "thread_idx_x");
+    }
+
+    #[test]
+    fn all_probe_is_explicit_and_exclusive() {
+        let ProbeInvocation::Evidence {
+            selection: EvidenceProbeSelection::All,
+            llc: Some(llc),
+            skip_terminal: true,
+        } = parse_probe_invocation(strings(&["--all", "--llc", "/tool/llc", "--skip-terminal"]))
+            .unwrap()
+        else {
+            panic!("expected an all-intrinsics probe")
+        };
+        assert_eq!(llc, PathBuf::from("/tool/llc"));
+
+        let error =
+            parse_probe_invocation(strings(&["--all", "--intrinsic", "thread_idx_x"])).unwrap_err();
+        assert!(error.to_string().contains("cannot be used together"));
+
+        let error = parse_probe_invocation(strings(&["--intrinsic", "--all", "--skip-terminal"]))
+            .unwrap_err();
+        assert!(error.to_string().contains("cannot be used together"));
+    }
+
+    #[test]
+    fn candidate_probe_rejects_all_selection() {
+        let error = parse_probe_invocation(strings(&[
+            "--candidate",
+            "--all",
+            "--intrinsic",
+            "thread_idx_x",
+            "--llc",
+            "/tool/llc",
+            "--gpu-target",
+            "sm_80",
+            "--ptx-feature",
+            "+ptx70",
+            "--skip-terminal",
+        ]))
+        .unwrap_err();
+        assert!(error.to_string().contains("unexpected arguments: --all"));
     }
 
     #[test]

@@ -4,7 +4,7 @@
  */
 
 use crate::model::{
-    BackendLoweringMechanism, CatalogInputs, CatalogIntrinsic, CatalogLlvm,
+    BackendLoweringMechanism, CatalogFile, CatalogInputs, CatalogIntrinsic, CatalogLlvm,
     CatalogTargetRequirement, CpAsyncSourceSize, EvidenceStageKind, IntrinsicBackend,
     IntrinsicSource, SparseMmaSelector, WarpShuffleAdapter,
 };
@@ -115,89 +115,175 @@ pub fn run(
         .iter()
         .find(|record| record.id == intrinsic_id)
         .with_context(|| format!("unknown catalog intrinsic {intrinsic_id}"))?;
-    let (llc, mode) = match llc {
-        Some(path) => (path, ProbeMode::Comparison),
-        None => (rust_toolchain_llc()?, ProbeMode::SelectedEvidence),
-    };
-    let identity = llc_identity(&llc)?;
-    validate_backend_identity(
-        mode,
-        &record.backend.version,
-        &record.backend.sha256,
-        &identity,
+    let runner = ProbeRunner::new(repo_root, &catalog, llc, skip_terminal)?;
+    runner.validate_backend(record)?;
+    runner.run(record)
+}
+
+pub fn run_all(repo_root: &Path, llc: Option<PathBuf>, skip_terminal: bool) -> Result<()> {
+    let catalog = resolve(repo_root)?;
+    ensure!(
+        !catalog.intrinsics.is_empty(),
+        "resolved catalog has no intrinsics to probe"
+    );
+    let runner = ProbeRunner::new(repo_root, &catalog, llc, skip_terminal)?;
+
+    validate_backend_identities(
+        runner.mode,
+        catalog.intrinsics.iter().map(|record| {
+            (
+                record.id.as_str(),
+                record.backend.version.as_str(),
+                record.backend.sha256.as_str(),
+            )
+        }),
+        &runner.identity,
     )?;
-    let output_dir = repo_root.join("target/intrinsics/probes");
-    fs::create_dir_all(&output_dir)?;
-    let catalog_json = pretty_json(&catalog)?;
-    let catalog_hash = sha256_bytes(catalog_json.as_bytes());
-    let input = output_dir.join(format!("{intrinsic_id}.ll"));
-    fs::write(&input, render_probe(&catalog, record, &catalog_hash))
-        .with_context(|| format!("write in-memory probe {}", input.display()))?;
-    if record.llvm.is_some()
-        && mode == ProbeMode::SelectedEvidence
-        && uses_typed_llvm_nvptx_lowering(record)
-    {
-        assert_intrinsic_declaration_canonicalizes(
-            &llc,
+
+    let total = catalog.intrinsics.len();
+    for (index, record) in catalog.intrinsics.iter().enumerate() {
+        eprintln!("[{}/{}] probing {}", index + 1, total, record.id);
+        runner
+            .run(record)
+            .with_context(|| format!("probe {}", record.id))?;
+    }
+    println!("probed all {total} generated intrinsic routes");
+    Ok(())
+}
+
+struct ProbeRunner<'a> {
+    catalog: &'a CatalogFile,
+    llc: PathBuf,
+    mode: ProbeMode,
+    identity: LlcIdentity,
+    output_dir: PathBuf,
+    catalog_hash: String,
+    skip_terminal: bool,
+}
+
+impl<'a> ProbeRunner<'a> {
+    fn new(
+        repo_root: &Path,
+        catalog: &'a CatalogFile,
+        llc: Option<PathBuf>,
+        skip_terminal: bool,
+    ) -> Result<Self> {
+        let (llc, mode) = match llc {
+            Some(path) => (path, ProbeMode::Comparison),
+            None => (rust_toolchain_llc()?, ProbeMode::SelectedEvidence),
+        };
+        let identity = llc_identity(&llc)?;
+        let output_dir = repo_root.join("target/intrinsics/probes");
+        fs::create_dir_all(&output_dir)?;
+        let catalog_json = pretty_json(catalog)?;
+        let catalog_hash = sha256_bytes(catalog_json.as_bytes());
+        Ok(Self {
+            catalog,
+            llc,
+            mode,
+            identity,
+            output_dir,
+            catalog_hash,
+            skip_terminal,
+        })
+    }
+
+    fn validate_backend(&self, record: &CatalogIntrinsic) -> Result<()> {
+        validate_backend_identity(
+            self.mode,
+            &record.backend.version,
+            &record.backend.sha256,
+            &self.identity,
+        )
+    }
+
+    fn run(&self, record: &CatalogIntrinsic) -> Result<()> {
+        let intrinsic_id = &record.id;
+        let input = self.output_dir.join(format!("{intrinsic_id}.ll"));
+        fs::write(
             &input,
-            &output_dir,
-            intrinsic_id,
-            record,
-        )?;
-    }
-    let output = output_dir.join(format!("{intrinsic_id}.ptx"));
-    let status = Command::new(&llc)
-        .arg(&input)
-        .arg("-march=nvptx64")
-        .arg(format!("-mcpu={}", record.backend.gpu_target))
-        .arg(format!("-mattr={}", record.backend.ptx_feature))
-        .arg("-o")
-        .arg(&output)
-        .status()
-        .with_context(|| format!("run {}", llc.display()))?;
-    ensure!(status.success(), "LLVM probe failed with {status}");
-    let ptx = fs::read_to_string(&output)
-        .with_context(|| format!("read generated PTX {}", output.display()))?;
-    validate_probe_instructions(record, &ptx)?;
-    let has_terminal_stage = record.backend_lowerings.iter().any(|lowering| {
-        lowering.backend == IntrinsicBackend::LlvmNvptx
-            && lowering
-                .stages
-                .iter()
-                .any(|stage| stage.stage == EvidenceStageKind::PtxAssembly)
-    });
-    if mode == ProbeMode::SelectedEvidence && has_terminal_stage {
-        if skip_terminal {
-            println!(
-                "backend-only probe: `--skip-terminal` was explicit, so recorded ptxas evidence was not revalidated"
-            );
-        } else {
-            assemble_probe_ptx(record, &output, &output_dir, intrinsic_id)?;
+            render_probe(self.catalog, record, &self.catalog_hash),
+        )
+        .with_context(|| format!("write in-memory probe {}", input.display()))?;
+
+        if record.llvm.is_some()
+            && self.mode == ProbeMode::SelectedEvidence
+            && uses_typed_llvm_nvptx_lowering(record)
+        {
+            assert_intrinsic_declaration_canonicalizes(
+                &self.llc,
+                &input,
+                &self.output_dir,
+                intrinsic_id,
+                record,
+            )?;
         }
+        let output = self.output_dir.join(format!("{intrinsic_id}.ptx"));
+        let status = Command::new(&self.llc)
+            .arg(&input)
+            .arg("-march=nvptx64")
+            .arg(format!("-mcpu={}", record.backend.gpu_target))
+            .arg(format!("-mattr={}", record.backend.ptx_feature))
+            .arg("-o")
+            .arg(&output)
+            .status()
+            .with_context(|| format!("run {}", self.llc.display()))?;
+        ensure!(status.success(), "LLVM probe failed with {status}");
+        let ptx = fs::read_to_string(&output)
+            .with_context(|| format!("read generated PTX {}", output.display()))?;
+        validate_probe_instructions(record, &ptx)?;
+        let has_terminal_stage = record.backend_lowerings.iter().any(|lowering| {
+            lowering.backend == IntrinsicBackend::LlvmNvptx
+                && lowering
+                    .stages
+                    .iter()
+                    .any(|stage| stage.stage == EvidenceStageKind::PtxAssembly)
+        });
+        if self.mode == ProbeMode::SelectedEvidence && has_terminal_stage {
+            if self.skip_terminal {
+                println!(
+                    "backend-only probe: `--skip-terminal` was explicit, so recorded ptxas evidence was not revalidated"
+                );
+            } else {
+                assemble_probe_ptx(record, &output, &self.output_dir, intrinsic_id)?;
+            }
+        }
+        match self.mode {
+            ProbeMode::SelectedEvidence => println!(
+                "selected evidence backend {} (SHA-256 {}) lowered {} to `{}` for {} {}",
+                self.identity.version,
+                self.identity.sha256,
+                intrinsic_id,
+                record.expected_ptx,
+                record.backend.gpu_target,
+                record.backend.ptx_feature,
+            ),
+            ProbeMode::Comparison => println!(
+                "comparison backend {} (SHA-256 {}) lowered {} to `{}` for {} {}; this does not validate selected evidence {} (SHA-256 {})",
+                self.identity.version,
+                self.identity.sha256,
+                intrinsic_id,
+                record.expected_ptx,
+                record.backend.gpu_target,
+                record.backend.ptx_feature,
+                record.backend.version,
+                record.backend.sha256,
+            ),
+        }
+        println!("PTX: {}", output.display());
+        Ok(())
     }
-    match mode {
-        ProbeMode::SelectedEvidence => println!(
-            "selected evidence backend {} (SHA-256 {}) lowered {} to `{}` for {} {}",
-            identity.version,
-            identity.sha256,
-            intrinsic_id,
-            record.expected_ptx,
-            record.backend.gpu_target,
-            record.backend.ptx_feature,
-        ),
-        ProbeMode::Comparison => println!(
-            "comparison backend {} (SHA-256 {}) lowered {} to `{}` for {} {}; this does not validate selected evidence {} (SHA-256 {})",
-            identity.version,
-            identity.sha256,
-            intrinsic_id,
-            record.expected_ptx,
-            record.backend.gpu_target,
-            record.backend.ptx_feature,
-            record.backend.version,
-            record.backend.sha256,
-        ),
+}
+
+fn validate_backend_identities<'a>(
+    mode: ProbeMode,
+    identities: impl IntoIterator<Item = (&'a str, &'a str, &'a str)>,
+    actual: &LlcIdentity,
+) -> Result<()> {
+    for (intrinsic_id, expected_version, expected_sha256) in identities {
+        validate_backend_identity(mode, expected_version, expected_sha256, actual)
+            .with_context(|| format!("validate probe backend for {intrinsic_id}"))?;
     }
-    println!("PTX: {}", output.display());
     Ok(())
 }
 
@@ -1936,6 +2022,22 @@ mod tests {
         )
         .unwrap_err();
         assert!(hash_error.to_string().contains("SHA-256 mismatch"));
+    }
+
+    #[test]
+    fn all_probe_preflight_checks_every_backend_identity() {
+        let error = validate_backend_identities(
+            ProbeMode::SelectedEvidence,
+            [
+                ("first", "LLVM version 22.1.2-test", "abc123"),
+                ("last", "LLVM version 22.1.2-test", "different"),
+            ],
+            &identity(),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("validate probe backend for last"));
+        assert!(message.contains("SHA-256 mismatch"));
     }
 
     #[test]
