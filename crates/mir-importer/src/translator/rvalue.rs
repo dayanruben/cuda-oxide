@@ -593,45 +593,6 @@ pub fn translate_rvalue(
             let cast_op = MirCastOp::new(op);
             cast_op.set_attr_cast_kind(ctx, cast_kind_attr);
 
-            // Record rustc's niche encoding on the cast so mir-lower can
-            // rebuild our un-niched `MirEnumType` aggregate (issue #21).
-            // The attribute is a typed `NicheEncodingAttr` so the contract
-            // between importer and lowering is enforced by pliron rather
-            // than by a hand-rolled string key.
-            if matches!(kind, mir::CastKind::Transmute)
-                && let Ok(layout) = ty.layout()
-                && let rustc_public::abi::VariantsShape::Multiple {
-                    tag_encoding:
-                        rustc_public::abi::TagEncoding::Niche {
-                            untagged_variant,
-                            niche_variants,
-                            niche_start,
-                        },
-                    ..
-                } = &layout.shape().variants
-            {
-                // Niched scalars are at most 64 bits wide. If rustc ever
-                // hands us something wider, fail loudly instead of
-                // truncating: the wrong bit pattern would silently match a
-                // different enum variant at runtime.
-                let niche_start_u64 = u64::try_from(*niche_start).map_err(|_| {
-                    input_error_noloc!(TranslationErr::unsupported(format!(
-                        "Niche start {} exceeds u64; niched-enum Transmute with > 64-bit scalar is not supported",
-                        niche_start
-                    )))
-                })?;
-                let niche_variant_idx = niche_variants.start().to_index() as u32;
-                let untagged_variant_idx = untagged_variant.to_index() as u32;
-                cast_op.set_attr_niche_encoding(
-                    ctx,
-                    dialect_mir::attributes::NicheEncodingAttr {
-                        niche_start: niche_start_u64,
-                        niche_variant_idx,
-                        untagged_variant_idx,
-                    },
-                );
-            }
-
             let result = op.deref(ctx).get_result(0);
 
             Ok((Some(op), result, prev_op_after_operand))
@@ -662,12 +623,17 @@ pub fn translate_rvalue(
                         loc.clone(),
                     )?;
 
-                    // Get the result type: tuple(operand_type, bool)
-                    // The first element matches the operand type (could be i32, usize, etc.)
-                    let operand_type = left_val.get_type(ctx);
-                    let bool_type = types::get_bool_type(ctx).into();
-                    let tuple_type = types::MirTupleType::get(ctx, vec![operand_type, bool_type]);
-                    let result_type_ptr = tuple_type.to_handle();
+                    // The result type is the MIR-level `(T, bool)` tuple.
+                    // Translate it from the rvalue's rustc type so it is the
+                    // same uniqued, layout-carrying tuple type the rest of
+                    // the body (locals, places) uses.
+                    let rust_tuple_ty = rvalue.ty(body.locals()).map_err(|e| {
+                        input_error_noloc!(TranslationErr::unsupported(format!(
+                            "Failed to query checked-arithmetic result type: {:?}",
+                            e
+                        )))
+                    })?;
+                    let result_type_ptr = types::translate_type(ctx, &rust_tuple_ty)?;
 
                     // Create a checked operation based on the binary operator
                     let op_id = match bin_op {
@@ -1108,7 +1074,6 @@ pub fn translate_rvalue(
 
                     // Translate all element operands
                     let mut element_values = Vec::with_capacity(operands.len());
-                    let mut element_types = Vec::with_capacity(operands.len());
                     let mut current_prev_op = prev_op;
 
                     for operand in operands {
@@ -1122,12 +1087,19 @@ pub fn translate_rvalue(
                             loc.clone(),
                         )?;
                         element_values.push(val);
-                        element_types.push(val.get_type(ctx));
                         current_prev_op = new_prev_op;
                     }
 
-                    // Create the tuple type
-                    let tuple_ty = dialect_mir::types::MirTupleType::get(ctx, element_types);
+                    // Translate the tuple type from the rvalue's rustc type
+                    // so it carries rustc's layout and uniques with the
+                    // tuple type of the destination place.
+                    let rust_tuple_ty = rvalue.ty(body.locals()).map_err(|e| {
+                        input_error_noloc!(TranslationErr::unsupported(format!(
+                            "Failed to query tuple aggregate type: {:?}",
+                            e
+                        )))
+                    })?;
+                    let tuple_ty = types::translate_type(ctx, &rust_tuple_ty)?;
 
                     // Create mir.construct_tuple operation
                     use dialect_mir::ops::MirConstructTupleOp;
@@ -1135,7 +1107,7 @@ pub fn translate_rvalue(
                     let op = Operation::new(
                         ctx,
                         MirConstructTupleOp::get_concrete_op_info(),
-                        vec![tuple_ty.into()],
+                        vec![tuple_ty],
                         element_values,
                         vec![],
                         0,
@@ -1461,19 +1433,21 @@ pub fn translate_rvalue(
         mir::Rvalue::Discriminant(place) => {
             // Get the discriminant (tag) from an enum value.
             //
-            // Two discriminant types are in play:
-            //   - `native_tag_ty`: the physical tag type stored in memory,
-            //     tracked by `MirEnumType::discriminant_type()` (e.g. `u8`
-            //     for a niche-optimized `Option<*mut T>`).
+            // Two discriminant types can be in play:
+            //   - `native_tag_ty`: the logical result type produced by our
+            //     enum operation. For Direct layouts this is the physical tag
+            //     type; for Niche/Single layouts the operation decodes or
+            //     materializes the logical discriminant directly.
             //   - `mir_discr_ty`: the type stable-MIR declares for the
             //     `Rvalue::Discriminant(place)` value itself, via
             //     `Ty::kind().discriminant_ty()`. This is what rustc uses
             //     to type the destination local (often `i64`).
             //
-            // `MirGetDiscriminantOp` returns the native tag. When the two
-            // types disagree we widen via `mir.cast IntToInt` so the rvalue
-            // matches what stable-MIR promised. Without this, storing the
-            // result into its destination slot would fail verification.
+            // When the two types disagree (normally a narrow Direct tag versus
+            // stable MIR's wider declared type), widen via `mir.cast IntToInt`
+            // so the rvalue matches what stable MIR promised. Without this,
+            // storing the result into its destination slot would fail
+            // verification.
             use dialect_mir::ops::MirGetDiscriminantOp;
             use dialect_mir::types::MirEnumType;
             use pliron::builtin::types::IntegerType;
@@ -5945,6 +5919,23 @@ fn translate_enum_constant(
     prev_op: Option<Ptr<Operation>>,
     loc: Location,
 ) -> TranslationResult<(Value, Option<Ptr<Operation>>)> {
+    let relocation_count = match constant.const_.kind() {
+        ConstantKind::Allocated(alloc) => alloc.provenance.ptrs.len(),
+        ConstantKind::Ty(ty_const) => match ty_const.kind() {
+            rustc_public::ty::TyConstKind::Value(_, alloc) => alloc.provenance.ptrs.len(),
+            _ => 0,
+        },
+        _ => 0,
+    };
+    if relocation_count != 0 {
+        return input_err!(
+            loc,
+            TranslationErr::unsupported(format!(
+                "Enum constant contains {} pointer relocation(s); cuda-oxide cannot yet preserve enum pointer provenance",
+                relocation_count
+            ))
+        );
+    }
     let enum_bytes = constant_bytes(constant, "enum", loc.clone())?;
     translate_enum_constant_from_bytes(
         ctx,
@@ -6113,6 +6104,182 @@ fn translate_enum_constant_from_bytes(
     Ok((val, Some(enum_op.get_operation())))
 }
 
+/// Translate a struct value from raw bytes plus the Rust type/layout metadata.
+///
+/// This is the byte-slice counterpart to [`translate_struct_constant`] and is
+/// used whenever a constant field has a struct type (e.g. `NonZero<T>` wrappers
+/// inside enum payloads). Each field is parsed recursively so nested newtypes
+/// are handled automatically.
+fn translate_struct_constant_from_bytes(
+    ctx: &mut Context,
+    rust_ty: &rustc_public::ty::Ty,
+    const_ty_ptr: TypeHandle,
+    struct_bytes: &[u8],
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    loc: Location,
+) -> TranslationResult<(Value, Option<Ptr<Operation>>)> {
+    use rustc_public::ty::{RigidTy, TyKind};
+
+    let field_types: Vec<TypeHandle> = {
+        let ty_obj = const_ty_ptr.deref(ctx);
+        let struct_ty = ty_obj
+            .downcast_ref::<dialect_mir::types::MirStructType>()
+            .ok_or_else(|| {
+                input_error_noloc!(TranslationErr::unsupported(
+                    "translate_struct_constant_from_bytes called on non-struct type"
+                ))
+            })?;
+        struct_ty.field_types().to_vec()
+    };
+
+    let layout = rust_ty.layout().map_err(|e| {
+        input_error_noloc!(TranslationErr::unsupported(format!(
+            "Failed to query layout for struct constant: {:?}",
+            e
+        )))
+    })?;
+    let shape = layout.shape();
+
+    let field_offsets: Vec<usize> = match &shape.fields {
+        rustc_public::abi::FieldsShape::Arbitrary { offsets } => {
+            offsets.iter().map(|offset| offset.bytes()).collect()
+        }
+        rustc_public::abi::FieldsShape::Primitive => vec![0; field_types.len()],
+        rustc_public::abi::FieldsShape::Union { .. } => vec![0; field_types.len()],
+        other => {
+            return input_err!(
+                loc,
+                TranslationErr::unsupported(format!(
+                    "Struct constant fields use unsupported shape {:?}",
+                    other
+                ))
+            );
+        }
+    };
+
+    let (adt_def, substs) = match rust_ty.kind() {
+        TyKind::RigidTy(RigidTy::Adt(adt_def, substs)) => (adt_def, substs),
+        other => {
+            return input_err!(
+                loc,
+                TranslationErr::unsupported(format!(
+                    "Expected ADT Rust type for struct constant, got {:?}",
+                    other
+                ))
+            );
+        }
+    };
+
+    // Structs have a single variant in the ADT metadata.
+    let variants = adt_def.variants();
+    let struct_variant = variants.first().ok_or_else(|| {
+        input_error_noloc!(TranslationErr::unsupported(
+            "Struct ADT has no variants in metadata"
+        ))
+    })?;
+
+    let mut field_values = Vec::with_capacity(field_types.len());
+    let mut current_prev_op = prev_op;
+
+    for (field_idx, field_ty_ptr) in field_types.iter().copied().enumerate() {
+        let fields = struct_variant.fields();
+        let rust_field = fields.get(field_idx).ok_or_else(|| {
+            input_error_noloc!(TranslationErr::unsupported(format!(
+                "Struct constant field {} is missing in rustc ADT metadata ({} field(s) recorded)",
+                field_idx,
+                fields.len()
+            )))
+        })?;
+        let rust_field_ty = rust_field.ty_with_args(&substs);
+        let field_layout = rust_field_ty.layout().map_err(|e| {
+            input_error_noloc!(TranslationErr::unsupported(format!(
+                "Failed to query layout for struct field {}: {:?}",
+                field_idx, e
+            )))
+        })?;
+        let field_size = field_layout.shape().size.bytes();
+        let field_offset = *field_offsets.get(field_idx).ok_or_else(|| {
+            input_error_noloc!(TranslationErr::unsupported(format!(
+                "Missing layout offset for struct field {}",
+                field_idx
+            )))
+        })?;
+
+        if field_size == 0 {
+            let (zst_val, new_prev_op) = translate_zero_sized_constant_value(
+                ctx,
+                field_ty_ptr,
+                block_ptr,
+                current_prev_op,
+                loc.clone(),
+            )?;
+            field_values.push(zst_val);
+            current_prev_op = new_prev_op;
+            continue;
+        }
+
+        let field_end = field_offset.checked_add(field_size).ok_or_else(|| {
+            input_error_noloc!(TranslationErr::unsupported(format!(
+                "Struct field {} offset {} + size {} overflowed",
+                field_idx, field_offset, field_size
+            )))
+        })?;
+        if field_end > struct_bytes.len() {
+            return input_err!(
+                loc,
+                TranslationErr::unsupported(format!(
+                    "Struct constant has {} bytes, but field {} needs [{}..{})",
+                    struct_bytes.len(),
+                    field_idx,
+                    field_offset,
+                    field_end
+                ))
+            );
+        }
+
+        let field_bytes = &struct_bytes[field_offset..field_end];
+        let (field_val, new_prev_op) = translate_constant_value_from_bytes(
+            ctx,
+            &rust_field_ty,
+            field_ty_ptr,
+            field_bytes,
+            block_ptr,
+            current_prev_op,
+            loc.clone(),
+        )?;
+        field_values.push(field_val);
+        current_prev_op = new_prev_op;
+    }
+
+    let (casted_field_values, prev_after_casts) = cast_struct_fields_to_expected_types(
+        ctx,
+        field_values,
+        const_ty_ptr,
+        block_ptr,
+        current_prev_op,
+        loc.clone(),
+    );
+
+    let op = Operation::new(
+        ctx,
+        MirConstructStructOp::get_concrete_op_info(),
+        vec![const_ty_ptr],
+        casted_field_values,
+        vec![],
+        0,
+    );
+    op.deref_mut(ctx).set_loc(loc.clone());
+
+    if let Some(prev) = prev_after_casts {
+        op.insert_after(ctx, prev);
+    } else {
+        op.insert_at_front(block_ptr, ctx);
+    }
+
+    Ok((op.deref(ctx).get_result(0), Some(op)))
+}
+
 /// Translate one field-sized byte slice into a constant value.
 fn translate_constant_value_from_bytes(
     ctx: &mut Context,
@@ -6139,6 +6306,18 @@ fn translate_constant_value_from_bytes(
         .unwrap_or(false);
     if is_zst || types::is_zst_type(ctx, ty_ptr) {
         return translate_zero_sized_constant_value(ctx, ty_ptr, block_ptr, prev_op, loc);
+    }
+
+    // Struct-typed constants (e.g. `NonZero<T>` wrappers inside enum payloads)
+    // need per-field construction rather than a single scalar constant.
+    let is_struct = {
+        let ty_ref = ty_ptr.deref(ctx);
+        ty_ref.is::<dialect_mir::types::MirStructType>()
+    };
+    if is_struct {
+        return translate_struct_constant_from_bytes(
+            ctx, rust_ty, ty_ptr, bytes, block_ptr, prev_op, loc,
+        );
     }
 
     enum ValueKind {
@@ -6801,6 +6980,27 @@ pub(crate) fn constant_bytes(
 }
 
 /// Determine the active enum variant from layout metadata plus raw bytes.
+fn decode_niche_variant_index(
+    tag_value: u128,
+    carrier_mask: u128,
+    niche_start: u128,
+    niche_variant_start: usize,
+    niche_variant_end: usize,
+    untagged_variant: usize,
+) -> usize {
+    let relative = tag_value.wrapping_sub(niche_start) & carrier_mask;
+    let span = (niche_variant_end - niche_variant_start) as u128;
+
+    // Compare at the full physical carrier width. Converting `relative` to
+    // host usize before this check can turn 2^64 into zero on a 64-bit host
+    // and select the wrong variant for an i128 carrier.
+    if relative <= span {
+        niche_variant_start + relative as usize
+    } else {
+        untagged_variant
+    }
+}
+
 fn enum_variant_index_from_bytes(
     rust_ty: &rustc_public::ty::Ty,
     enum_bytes: &[u8],
@@ -6883,14 +7083,14 @@ fn enum_variant_index_from_bytes(
 
                     let niche_start_idx = niche_variants.start().to_index();
                     let niche_end_idx = niche_variants.end().to_index();
-                    let relative = tag_value.wrapping_sub(*niche_start) & mask;
-                    let candidate = niche_start_idx.saturating_add(relative as usize);
-
-                    if candidate >= niche_start_idx && candidate <= niche_end_idx {
-                        Ok(candidate)
-                    } else {
-                        Ok(untagged_variant.to_index())
-                    }
+                    Ok(decode_niche_variant_index(
+                        tag_value,
+                        mask,
+                        *niche_start,
+                        niche_start_idx,
+                        niche_end_idx,
+                        untagged_variant.to_index(),
+                    ))
                 }
             }
         }
@@ -7744,6 +7944,25 @@ fn create_ghost_enum_default(
     op
 }
 
-// (The hand-rolled niche-attribute writer that lived here was replaced
-// by `MirCastOp::set_attr_niche_encoding(...)`, generated from the typed
-// `NicheEncodingAttr` slot declared on the op.)
+#[cfg(test)]
+mod enum_niche_decode_tests {
+    use super::decode_niche_variant_index;
+
+    #[test]
+    fn i128_relative_value_is_checked_before_usize_conversion() {
+        assert_eq!(
+            decode_niche_variant_index(1u128 << 64, u128::MAX, 0, 0, 1, 2),
+            2,
+            "2^64 must not truncate to relative variant zero on a 64-bit host"
+        );
+    }
+
+    #[test]
+    fn niche_decode_wraps_at_the_carrier_width() {
+        assert_eq!(
+            decode_niche_variant_index(0, u8::MAX.into(), u8::MAX.into(), 3, 4, 1),
+            4,
+            "u8 carrier value 0 is one step after niche_start 255"
+        );
+    }
+}
