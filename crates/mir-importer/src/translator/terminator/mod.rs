@@ -359,16 +359,27 @@ fn translate_assert(
     // panic occurs, the GPU thread traps.
     let _ = unwind;
 
-    // Translate the condition operand
+    // Translate the condition operand.
+    //
+    // MIR assert conditions are operands, not necessarily places. In
+    // particular, rustc can retain boolean constants for guaranteed-failure
+    // blocks and deliberate traps. The shared operand translator preserves the
+    // old Copy/Move path by delegating to `translate_place`.
+    //
+    // Keep RuntimeChecks fail-closed here. `translate_operand` currently lowers
+    // those session-dependent flags to `false` without access to rustc's
+    // `Session`; accepting them as assert conditions would silently change the
+    // requested assertion policy. They need separate session-policy plumbing.
     let (cond_value, mut last_inserted) = match cond {
-        mir::Operand::Copy(place) | mir::Operand::Move(place) => {
-            rvalue::translate_place(ctx, body, place, value_map, block_ptr, prev_op, loc.clone())?
+        mir::Operand::Copy(_) | mir::Operand::Move(_) | mir::Operand::Constant(_) => {
+            rvalue::translate_operand(ctx, body, cond, value_map, block_ptr, prev_op, loc.clone())?
         }
-        _ => {
+        mir::Operand::RuntimeChecks(_) => {
             return input_err!(
                 loc.clone(),
                 TranslationErr::unsupported(
-                    "Constant conditions in assert not yet implemented".to_string(),
+                    "RuntimeChecks conditions in assert require session-policy lowering"
+                        .to_string(),
                 )
             );
         }
