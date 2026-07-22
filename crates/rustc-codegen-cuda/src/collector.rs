@@ -159,8 +159,8 @@ enum CollectDecision {
 // "test extern first" ordering dance that lived here previously.
 use reserved_oxide_symbols::{
     device_extern_base_name, is_current_device_symbol, is_current_kernel_symbol,
-    is_device_extern_symbol, is_device_symbol, is_kernel_symbol, is_ptx_merge_required_marker,
-    kernel_base_name,
+    is_device_extern_symbol, is_device_symbol, is_kernel_symbol, is_legacy_kernel_symbol,
+    is_ptx_merge_required_marker, kernel_base_name,
 };
 
 /// Sanitize a symbol name for use as a PTX identifier.
@@ -381,9 +381,15 @@ fn unsupported_codegen_protocol_root(name: &str) -> bool {
 
 /// Checks if a function is a kernel entry point.
 ///
-/// Detection is based on the `KERNEL_PREFIX` substring (currently
-/// `cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_`) which the `#[kernel]` macro adds to
-/// renamed functions:
+/// Detection is based on the generated namespace in the *final* def-path
+/// segment: it must start with `KERNEL_PREFIX` (currently
+/// `cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_`) or, for roots emitted
+/// before the scoped Cargo cache protocol, `LEGACY_KERNEL_PREFIX`. Legacy
+/// roots stay classified so the protocol handshake can reject them with an
+/// explicit diagnostic instead of silently skipping device codegen. The
+/// final-segment check matters because a named item nested inside a kernel
+/// has the kernel symbol as an earlier path segment, but is a device helper
+/// rather than another entry point.
 ///
 /// ```text
 /// User writes:        Macro expands to:
@@ -393,7 +399,20 @@ fn unsupported_codegen_protocol_root(name: &str) -> bool {
 /// └─────────────────┘  └────────────────────────────────────────────────┘
 /// ```
 pub fn is_kernel_function(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
-    is_kernel_symbol(&tcx.def_path_str(def_id))
+    is_kernel_entry_def_path(&tcx.def_path_str(def_id))
+}
+
+/// Returns `true` when `def_path` names a kernel entry point *itself*, as
+/// opposed to an item nested inside a kernel body.
+///
+/// A closure or named `fn` defined inside a `#[kernel]` has the kernel's name
+/// as an earlier path segment (`...::cuda_oxide_kernel_<hash>_k::helper`).
+/// Nested items are plain device functions, exported under their canonical
+/// mangled symbol by the call-graph walk. Rooting them as kernels would give
+/// generic nested fns a `_TID_<hash>` export name that no call site references,
+/// failing module verification with "Symbol ... not found".
+pub(crate) fn is_kernel_entry_def_path(def_path: &str) -> bool {
+    is_current_kernel_symbol(def_path) || is_legacy_kernel_symbol(def_path)
 }
 
 /// Checks if a function is a standalone device function definition.
@@ -730,20 +749,6 @@ pub fn collect_device_functions<'tcx>(
             if let MonoItem::Fn(instance) = item
                 && is_kernel_function(tcx, instance.def_id())
             {
-                // Skip closures inside kernels - they are device functions, not kernels.
-                // Closures have names like "cuda_oxide_kernel_<hash>_foo::{closure#0}" but
-                // only "cuda_oxide_kernel_<hash>_foo" is the actual kernel entry point.
-                let name = tcx.def_path_str(instance.def_id());
-                if name.contains("{closure") || name.contains("::closure") {
-                    if verbose {
-                        eprintln!(
-                            "[collector] Skipping closure inside kernel (not an entry point): {}",
-                            name
-                        );
-                    }
-                    continue;
-                }
-
                 // Skip generic (non-monomorphized) instances.
                 // For generic kernels like scale<T>, the CGU contains both:
                 // - The generic definition (scale<T>) - skip this
@@ -2132,7 +2137,7 @@ mod tests {
         PTX_MERGE_REQUIRED_PREFIX, is_ptx_merge_required_marker, ptx_merge_required_marker,
     };
 
-    use super::unsupported_codegen_protocol_root;
+    use super::{is_kernel_entry_def_path, unsupported_codegen_protocol_root};
 
     #[test]
     fn ptx_merge_marker_matches_only_the_final_path_component() {
@@ -2174,5 +2179,69 @@ mod tests {
         assert!(!unsupported_codegen_protocol_root(
             "ordinary::host_function"
         ));
+    }
+
+    #[test]
+    fn kernel_def_paths_are_entry_points() {
+        // Bare and fully-qualified kernel names: the marker is the final segment.
+        assert!(is_kernel_entry_def_path(&format!("{KERNEL_PREFIX}vecadd")));
+        assert!(is_kernel_entry_def_path(&format!(
+            "kernels::{KERNEL_PREFIX}vecadd"
+        )));
+        assert!(is_kernel_entry_def_path(&format!(
+            "my_crate::kernels::{KERNEL_PREFIX}vecadd"
+        )));
+        // Legacy roots still classify as entry points. They must not vanish
+        // as ordinary host functions: the scoped-cache handshake rejects
+        // them with an explicit diagnostic (see
+        // `unsupported_codegen_protocol_root`), and builds outside the
+        // protocol continue to compile them.
+        assert!(is_kernel_entry_def_path(&format!(
+            "legacy::{LEGACY_KERNEL_PREFIX}vecadd"
+        )));
+    }
+
+    #[test]
+    fn items_nested_inside_kernel_bodies_are_not_entry_points() {
+        // A named fn defined inside a kernel body: the kernel name is a path
+        // prefix, not the final segment. Rooting it would mint a `_TID_`
+        // export name (generic case) that no call site references.
+        assert!(!is_kernel_entry_def_path(&format!(
+            "{KERNEL_PREFIX}softmax::reduce_workspace_max"
+        )));
+        assert!(!is_kernel_entry_def_path(&format!(
+            "my_crate::kernels::{KERNEL_PREFIX}softmax::helper"
+        )));
+        // Deeper nesting (fn inside a block inside the kernel).
+        assert!(!is_kernel_entry_def_path(&format!(
+            "{KERNEL_PREFIX}softmax::inner::helper"
+        )));
+    }
+
+    #[test]
+    fn closures_inside_kernel_bodies_are_not_entry_points() {
+        assert!(!is_kernel_entry_def_path(&format!(
+            "{KERNEL_PREFIX}map::{{closure#0}}"
+        )));
+        assert!(!is_kernel_entry_def_path(&format!(
+            "kernels::{KERNEL_PREFIX}map::{{closure#1}}"
+        )));
+    }
+
+    #[test]
+    fn non_kernel_paths_are_not_entry_points() {
+        assert!(!is_kernel_entry_def_path("my_crate::helpers::sum_slice"));
+        // The marker must begin the final segment. A substring match here
+        // would let ordinary near-miss names masquerade as kernel entries.
+        assert!(!is_kernel_entry_def_path(&format!(
+            "my_crate::helpers::not_{KERNEL_PREFIX}vecadd"
+        )));
+        assert!(!is_kernel_entry_def_path(&format!(
+            "my_crate::helpers::not_{LEGACY_KERNEL_PREFIX}vecadd"
+        )));
+        assert!(!is_kernel_entry_def_path(&format!(
+            "my_crate::helpers::prefix{KERNEL_PREFIX}vecadd"
+        )));
+        assert!(!is_kernel_entry_def_path(""));
     }
 }
