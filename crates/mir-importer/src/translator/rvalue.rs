@@ -2220,8 +2220,26 @@ pub fn translate_operand(
                             )))
                         })? as usize;
 
+                    // The pointee is decoded from raw bytes below, with no
+                    // provenance map to resolve pointers nested inside it, so
+                    // a pointee that itself contains relocations must fail
+                    // loudly before its placeholder bytes decode as addresses.
+                    let reject_pointee_relocations = |relocations: usize| -> TranslationResult<()> {
+                        if relocations != 0 {
+                            return input_err!(
+                                loc.clone(),
+                                TranslationErr::unsupported(format!(
+                                    "Promoted constant's pointee contains {relocations} pointer \
+                                         relocation(s); cuda-oxide cannot yet preserve nested \
+                                         pointer provenance"
+                                ))
+                            );
+                        }
+                        Ok(())
+                    };
                     let target_bytes: Vec<u8> = match GlobalAlloc::from(alloc_id) {
                         GlobalAlloc::Memory(target_alloc) => {
+                            reject_pointee_relocations(target_alloc.provenance.ptrs.len())?;
                             target_alloc.raw_bytes().ok().unwrap_or_else(|| {
                                 target_alloc
                                     .bytes
@@ -2237,6 +2255,7 @@ pub fn translate_operand(
                                     e
                                 )))
                             })?;
+                            reject_pointee_relocations(target_alloc.provenance.ptrs.len())?;
                             target_alloc.raw_bytes().ok().unwrap_or_else(|| {
                                 target_alloc
                                     .bytes
@@ -5239,14 +5258,15 @@ fn translate_array_value_constant_inner(
 /// 4. Create constant operations for each field
 /// 5. Create MirConstructStructOp with those operands
 ///
-/// ## Limitations
-///
-/// - Assumes simple layout without complex padding (works for most structs)
-/// - Nested structs with complex layouts may need refinement
+/// Each field is read at the byte offset rustc's layout records for it, so
+/// padding between fields and any reordering rustc applies are both accounted
+/// for. A field's size comes from the same layout, which is why a padded struct
+/// nested inside another is sliced at its true width rather than at the sum of
+/// its fields.
 fn translate_struct_constant(
     ctx: &mut Context,
     constant: &mir::ConstOperand,
-    _rust_ty: &rustc_public::ty::Ty, // Reserved for future layout computation
+    rust_ty: &rustc_public::ty::Ty,
     const_ty_ptr: TypeHandle,
     block_ptr: Ptr<BasicBlock>,
     prev_op: Option<Ptr<Operation>>,
@@ -5268,19 +5288,78 @@ fn translate_struct_constant(
         struct_ty.field_types().to_vec()
     };
 
-    // Get the bytes from the constant's allocation.
-    // For promoted constants like &(8..16), the allocation contains a pointer
-    // (8 zero bytes with provenance) pointing to another allocation with the actual struct data.
-    // We need to follow the provenance to get the real struct bytes.
+    // The constant's Rust type decides how to read the allocation. A
+    // reference or raw pointer means stable_mir handed over a promoted
+    // constant indirectly (`&(8..16)`): the allocation is a thin pointer whose
+    // provenance names the allocation with the actual struct data, and the
+    // layout query must run on the pointee. An aggregate type means the
+    // allocation IS the struct's memory image. Deciding by "has provenance"
+    // conflated the two: a by-value struct with a pointer field would have had
+    // its own bytes silently replaced by the first pointee's.
+    let by_ref_pointee = match rust_ty.kind() {
+        rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Ref(_, pointee, _))
+        | rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::RawPtr(pointee, _)) => {
+            Some(pointee)
+        }
+        _ => None,
+    };
+    let struct_rust_ty = by_ref_pointee.unwrap_or(*rust_ty);
+
+    // Read the struct's own bytes, rejecting pointer relocations before their
+    // placeholder bytes can be decoded as field values. A relocation's stored
+    // bytes are the offset into the target allocation, not an address, and the
+    // per-field decoders below carry no provenance map to resolve them.
+    let reject_struct_relocations = |relocations: usize| -> TranslationResult<()> {
+        if relocations != 0 {
+            return input_err!(
+                loc.clone(),
+                TranslationErr::unsupported(format!(
+                    "Struct constant contains {relocations} pointer relocation(s); \
+                     cuda-oxide cannot yet preserve struct pointer provenance"
+                ))
+            );
+        }
+        Ok(())
+    };
     let bytes = match constant.const_.kind() {
         ConstantKind::Allocated(alloc) => {
-            // Check if this allocation has provenance (i.e., it's a pointer to another allocation)
-            if let Some((_, prov)) = alloc.provenance.ptrs.first() {
-                // Follow the provenance to get the actual struct allocation
+            if by_ref_pointee.is_some() {
+                // Follow the by-ref indirection to the actual struct allocation.
                 use rustc_public::mir::alloc::GlobalAlloc;
+                let Some(&(prov_pos, prov)) = alloc.provenance.ptrs.first() else {
+                    return input_err!(
+                        loc,
+                        TranslationErr::unsupported(
+                            "Reference-to-struct constant has no provenance to follow".to_string()
+                        )
+                    );
+                };
+                // The pointer's data bytes encode the byte offset into the
+                // target allocation. The decode below slices from byte zero,
+                // so an interior reference must fail loudly rather than read
+                // fields from the wrong base.
+                let ptr_width = rustc_public::target::MachineInfo::target_pointer_width().bytes();
+                let ref_offset = alloc
+                    .read_partial_uint(prov_pos..prov_pos + ptr_width)
+                    .map_err(|e| {
+                        input_error_noloc!(TranslationErr::unsupported(format!(
+                            "Failed to read struct constant provenance offset: {:?}",
+                            e
+                        )))
+                    })?;
+                if ref_offset != 0 {
+                    return input_err!(
+                        loc,
+                        TranslationErr::unsupported(format!(
+                            "Reference-to-struct constant points at interior offset {ref_offset}; \
+                             cuda-oxide cannot yet decode interior references to constants"
+                        ))
+                    );
+                }
                 let alloc_id = prov.0;
                 match GlobalAlloc::from(alloc_id) {
                     GlobalAlloc::Memory(target_alloc) => {
+                        reject_struct_relocations(target_alloc.provenance.ptrs.len())?;
                         target_alloc.raw_bytes().ok().unwrap_or_else(|| {
                             target_alloc
                                 .bytes
@@ -5296,6 +5375,7 @@ fn translate_struct_constant(
                                 e
                             )))
                         })?;
+                        reject_struct_relocations(target_alloc.provenance.ptrs.len())?;
                         target_alloc.raw_bytes().ok().unwrap_or_else(|| {
                             target_alloc
                                 .bytes
@@ -5315,7 +5395,8 @@ fn translate_struct_constant(
                     }
                 }
             } else {
-                // No provenance - use bytes directly (inline struct constant)
+                // The allocation is the struct's own memory image.
+                reject_struct_relocations(alloc.provenance.ptrs.len())?;
                 alloc.raw_bytes().ok().unwrap_or_else(|| {
                     alloc
                         .bytes
@@ -5342,12 +5423,30 @@ fn translate_struct_constant(
         }
     };
 
-    // Parse field values from the bytes
+    // Parse field values from the bytes. `field_types` is in declaration order,
+    // and so is `field_offsets`, but the bytes are the struct's memory image: a
+    // field starts at its layout offset, which is not the sum of the sizes before
+    // it once rustc reorders fields or pads between them. The query runs on the
+    // struct type itself; for a by-ref constant, `rust_ty` is the reference,
+    // whose Primitive field shape the helper rejects.
+    let field_offsets = super::layout::aggregate_field_offsets(&struct_rust_ty, "Struct", &loc)?;
+    if field_offsets.len() != field_types.len() {
+        return input_err!(
+            loc,
+            TranslationErr::unsupported(format!(
+                "Struct constant layout has {} field offsets, type has {} fields",
+                field_offsets.len(),
+                field_types.len()
+            ))
+        );
+    }
+
     let mut field_values = Vec::with_capacity(field_types.len());
     let mut current_prev_op = prev_op;
-    let mut byte_offset = 0usize;
 
     for (field_idx, field_ty_ptr) in field_types.iter().copied().enumerate() {
+        let byte_offset = field_offsets[field_idx];
+
         // First, gather type information we need while holding immutable borrow
         enum FieldTypeKind {
             ZeroSized,
@@ -5444,8 +5543,6 @@ fn translate_struct_constant(
 
                 current_prev_op = Some(const_op.get_operation());
                 field_values.push(const_op.get_operation().deref(ctx).get_result(0));
-
-                byte_offset += byte_size;
             }
 
             FieldTypeKind::Float16 => {
@@ -5488,8 +5585,6 @@ fn translate_struct_constant(
 
                 current_prev_op = Some(float_op.get_operation());
                 field_values.push(float_op.get_operation().deref(ctx).get_result(0));
-
-                byte_offset += byte_size;
             }
 
             FieldTypeKind::Float32 => {
@@ -5541,8 +5636,6 @@ fn translate_struct_constant(
 
                 current_prev_op = Some(float_op.get_operation());
                 field_values.push(float_op.get_operation().deref(ctx).get_result(0));
-
-                byte_offset += byte_size;
             }
 
             FieldTypeKind::Pointer => {
@@ -5611,8 +5704,6 @@ fn translate_struct_constant(
 
                 current_prev_op = Some(cast_op);
                 field_values.push(cast_op.deref(ctx).get_result(0));
-
-                byte_offset += byte_size;
             }
 
             FieldTypeKind::Unsupported => {
@@ -5645,7 +5736,6 @@ fn translate_struct_constant(
                 )?;
                 current_prev_op = p;
                 field_values.push(v);
-                byte_offset += byte_size;
             }
         }
     }
@@ -5901,6 +5991,28 @@ fn translate_tuple_constant_from_bytes(
     Ok((op.deref(ctx).get_result(0), Some(op)))
 }
 
+/// Storage size of a struct constant from its recorded layout, or `None` when
+/// that layout is missing.
+///
+/// rustc's size counts the padding between and after fields, so it is what a
+/// reader must stride by. Summing the field sizes would under-report any padded
+/// struct and hand a short byte slice to whoever reads it.
+///
+/// Recorded offsets are what separates a known layout from a failed query:
+/// `translator/types.rs` stores empty offsets and a zero size when `Ty::layout()`
+/// fails. A zero size on its own does not imply a failure, since a struct whose
+/// fields are all zero-sized is genuinely zero bytes wide. `is_zst_type` does not
+/// cover those, because it calls a struct zero-sized only when it has no fields
+/// at all, so a `PhantomData` newtype reaches here with one field and a size of
+/// zero.
+fn struct_storage_size(field_count: usize, offset_count: usize, total_size: u64) -> Option<usize> {
+    if offset_count == 0 && field_count > 0 {
+        None
+    } else {
+        Some(total_size as usize)
+    }
+}
+
 fn constant_storage_size(ctx: &Context, ty_ptr: TypeHandle) -> Option<usize> {
     let ty_ref = ty_ptr.deref(ctx);
     if types::is_zst_type(ctx, ty_ptr) {
@@ -5916,12 +6028,11 @@ fn constant_storage_size(ctx: &Context, ty_ptr: TypeHandle) -> Option<usize> {
     } else if ty_ref.is::<dialect_mir::types::MirPtrType>() {
         Some(rustc_public::target::MachineInfo::target_pointer_width().bytes())
     } else if let Some(st) = ty_ref.downcast_ref::<dialect_mir::types::MirStructType>() {
-        let fields = st.field_types().to_vec();
-        let mut total = 0usize;
-        for f in fields {
-            total += constant_storage_size(ctx, f)?;
-        }
-        Some(total)
+        struct_storage_size(
+            st.field_types().len(),
+            st.field_offsets().len(),
+            st.total_size(),
+        )
     } else if let Some(at) = ty_ref.downcast_ref::<dialect_mir::types::MirArrayType>() {
         let elem = at.element_type();
         let n = at.size() as usize;
@@ -5950,11 +6061,22 @@ fn build_const_from_bytes(
             .map(|i| (i.width(), i.signedness()))
     };
     let is_f32 = { ty_ptr.deref(ctx).is::<FP32Type>() };
+    // Field offsets come from the struct type, which carries rustc's layout. The
+    // bytes are a memory image, so a field starts at its offset, not at the sum of
+    // the sizes before it.
     let struct_fields = {
         ty_ptr
             .deref(ctx)
             .downcast_ref::<dialect_mir::types::MirStructType>()
-            .map(|st| st.field_types().to_vec())
+            .map(|st| {
+                (
+                    st.field_types().to_vec(),
+                    st.field_offsets()
+                        .iter()
+                        .map(|offset| *offset as usize)
+                        .collect::<Vec<_>>(),
+                )
+            })
     };
     let array_info = {
         let t = ty_ptr.deref(ctx);
@@ -6010,12 +6132,32 @@ fn build_const_from_bytes(
         }
         return Ok((op.deref(ctx).get_result(0), Some(op)));
     }
-    if let Some(fields) = struct_fields {
+    if let Some((fields, offsets)) = struct_fields {
         use dialect_mir::ops::MirConstructStructOp;
+        if offsets.is_empty() && !fields.is_empty() {
+            // No offsets at all means `Ty::layout()` failed when the type was
+            // imported, rather than the two lists having drifted apart.
+            return input_err!(
+                loc,
+                TranslationErr::unsupported(
+                    "aggregate const: layout was not recorded for this struct".to_string()
+                )
+            );
+        }
+        if offsets.len() != fields.len() {
+            return input_err!(
+                loc,
+                TranslationErr::unsupported(format!(
+                    "aggregate const: struct has {} fields but {} layout offsets",
+                    fields.len(),
+                    offsets.len()
+                ))
+            );
+        }
+
         let mut vals = Vec::with_capacity(fields.len());
         let mut prev = prev_op;
-        let mut off = 0usize;
-        for fty in fields {
+        for (field_idx, fty) in fields.into_iter().enumerate() {
             let sz = constant_storage_size(ctx, fty).ok_or_else(|| {
                 input_error_noloc!(TranslationErr::unsupported(
                     "aggregate const: field size".to_string()
@@ -6028,17 +6170,24 @@ fn build_const_from_bytes(
                 prev = p;
                 continue;
             }
-            let (v, p) = build_const_from_bytes(
-                ctx,
-                fty,
-                &bytes[off..off + sz],
-                block_ptr,
-                prev,
-                loc.clone(),
-            )?;
+
+            let off = offsets[field_idx];
+            let end = off.checked_add(sz).filter(|end| *end <= bytes.len());
+            let Some(end) = end else {
+                return input_err!(
+                    loc,
+                    TranslationErr::unsupported(format!(
+                        "aggregate const: field {field_idx} needs {sz} bytes at offset {off}, \
+                         but only {} are available",
+                        bytes.len()
+                    ))
+                );
+            };
+
+            let (v, p) =
+                build_const_from_bytes(ctx, fty, &bytes[off..end], block_ptr, prev, loc.clone())?;
             vals.push(v);
             prev = p;
-            off += sz;
         }
         let (cv, pp) =
             cast_struct_fields_to_expected_types(ctx, vals, ty_ptr, block_ptr, prev, loc.clone());
@@ -6067,10 +6216,23 @@ fn build_const_from_bytes(
         let mut vals = Vec::with_capacity(n);
         let mut prev = prev_op;
         for i in 0..n {
+            let off = i * sz;
+            let end = off.checked_add(sz).filter(|end| *end <= bytes.len());
+            let Some(end) = end else {
+                return input_err!(
+                    loc,
+                    TranslationErr::unsupported(format!(
+                        "aggregate const: element {i} needs {sz} bytes at offset {off}, \
+                         but only {} are available",
+                        bytes.len()
+                    ))
+                );
+            };
+
             let (v, p) = build_const_from_bytes(
                 ctx,
                 elem_ty,
-                &bytes[i * sz..i * sz + sz],
+                &bytes[off..end],
                 block_ptr,
                 prev,
                 loc.clone(),
@@ -8227,5 +8389,32 @@ mod pointer_array_constant_type_tests {
             validate_ptr_to_array_constant_type(&ctx, tuple_array, Location::Unknown).is_err(),
             "bare tuple-array support must not widen pointer-to-array constants"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn struct_storage_size_reads_layout_presence_not_size() {
+        // Ordinary padded struct: size is the padded width, not the field sum.
+        assert_eq!(struct_storage_size(2, 2, 16), Some(16));
+
+        // A struct with fields that is genuinely zero-sized, such as a
+        // `PhantomData` newtype. rustc recorded an offset for the field, so the
+        // size of zero is the answer rather than a missing one.
+        assert_eq!(struct_storage_size(1, 1, 0), Some(0));
+
+        // Field-less struct. `is_zst_type` takes these before the struct arm is
+        // reached, but the predicate agrees with it.
+        assert_eq!(struct_storage_size(0, 0, 0), Some(0));
+
+        // `Ty::layout()` failed when the type was imported, which
+        // `translator/types.rs` records as no offsets and a zero size.
+        assert_eq!(struct_storage_size(2, 0, 0), None);
+
+        // Same failure on a type whose size was recorded before the query failed.
+        assert_eq!(struct_storage_size(1, 0, 8), None);
     }
 }
