@@ -9,8 +9,6 @@
   </picture>
 </p>
 
-# cuda-oxide
-
 cuda-oxide is a custom rustc backend for compiling GPU kernels in pure Rust.
 The workspace combines:
 
