@@ -631,7 +631,7 @@ So `llc` is resolved first, by the table above, and its major is read from
 | 4th      | `opt-22` / `opt-21` / `opt` on `PATH`              | Filtered to the same major as `llc`.                                  |
 
 If no same-major `opt` exists, resolution records a diagnostic naming every
-rejected candidate. The experimental API treats a requested optimization as
+rejected candidate. The standalone API treats a requested optimization as
 strict and fails; the legacy rustc path falls back to running unoptimized.
 
 Because step 2 keys off whichever `llc` won, pinning `CUDA_OXIDE_LLC` alone is
@@ -654,7 +654,7 @@ the kernel calls into libdevice. Both have their own override:
 When either piece is missing, the two paths react differently. An ordinary
 build does not fail: the backend's path decision sees that the IR-level link
 is unavailable and falls back to the NVVM path, the same automatic switch
-described under target selection. The experimental API's `Linking::Libdevice`
+described under target selection. The standalone API's `Linking::Libdevice`
 is strict and fails up front instead, with a `LibdeviceUnavailable` error
 naming the missing piece: `libdevice.10.bc`, or an `llvm-link` sharing the
 selected `llc`'s major.
